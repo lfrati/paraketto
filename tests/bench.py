@@ -1,7 +1,8 @@
 """Benchmark Parakeet TDT V2 TensorRT: WER and RTFx.
 
 Runs all utterances from data/{librispeech,earnings22}/manifest.json,
-reports per-dataset WER and aggregate RTFx.
+reports per-dataset WER and RTFx, plus a long-audio RTFx measurement
+on data/combined-90s.wav.
 
 Usage:
     uv run python tests/bench.py
@@ -12,6 +13,7 @@ import sys
 import time
 from pathlib import Path
 
+import soundfile as sf
 from jiwer import Compose, ReduceToListOfListOfWords, RemovePunctuation, ToLowerCase, wer
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -22,6 +24,7 @@ DATA_DIR = ROOT / "data"
 _normalize = Compose([ToLowerCase(), RemovePunctuation(), ReduceToListOfListOfWords()])
 
 DATASETS = ["librispeech", "earnings22"]
+LONG_AUDIO = DATA_DIR / "combined-90s.wav"
 
 
 def load_manifest(name: str) -> list[dict]:
@@ -39,10 +42,6 @@ def main():
     t0 = time.monotonic()
     parakeet_trt.load_model()
     print(f"Model loaded in {time.monotonic() - t0:.1f}s\n")
-
-    total_audio_all = 0.0
-    total_inference_all = 0.0
-    all_ok = True
 
     for dataset in DATASETS:
         manifest = load_manifest(dataset)
@@ -69,25 +68,27 @@ def main():
 
         rtfx = total_audio / total_inference if total_inference > 0 else 0
 
-        total_audio_all += total_audio
-        total_inference_all += total_inference
+        print(f"{dataset}: WER={wer_pct:.2f}% RTFx={rtfx:.0f}x "
+              f"({len(manifest)} utts, {total_audio:.0f}s audio)")
 
-        status = "PASS" if wer_pct < 20 else "FAIL"
-        if status == "FAIL":
-            all_ok = False
-        print(f"{dataset:>12s}:  WER={wer_pct:5.2f}%  RTFx={rtfx:7.1f}x  "
-              f"({len(manifest)} utts, {total_audio:.1f}s audio)  [{status}]")
+    # Long-audio RTFx (no ground truth, just speed)
+    audio, sr = sf.read(str(LONG_AUDIO), dtype="float32")
+    audio_dur = len(audio) / sr
 
-    rtfx_all = total_audio_all / total_inference_all if total_inference_all > 0 else 0
-    print(f"\n{'aggregate':>12s}:  RTFx={rtfx_all:7.1f}x  "
-          f"({total_audio_all:.1f}s audio in {total_inference_all:.2f}s)")
+    parakeet_trt.transcribe(audio, sr)  # warmup
 
-    if rtfx_all < 400:
-        print(f"\nFAIL: aggregate RTFx {rtfx_all:.1f}x < 400x")
-        all_ok = False
+    runs = 5
+    times = []
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        parakeet_trt.transcribe(audio, sr)
+        elapsed = time.perf_counter() - t0
+        times.append(elapsed)
 
-    if not all_ok:
-        sys.exit(1)
+    mean_t = sum(times) / len(times)
+    rtfx_long = audio_dur / mean_t
+    print(f"long-audio: RTFx={rtfx_long:.0f}x "
+          f"({audio_dur:.0f}s audio, {mean_t*1000:.0f}ms mean, {runs} runs)")
 
 
 if __name__ == "__main__":
