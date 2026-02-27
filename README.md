@@ -8,8 +8,7 @@ Prerequisites: Linux, NVIDIA GPU, CUDA toolkit, Python 3.10+, [uv](https://docs.
 
 ```bash
 uv sync
-make bench   # benchmark TensorRT transcription (~500x real-time)
-make test    # accuracy test against sample audio
+make bench   # WER + RTFx benchmark (80 utterances, ~9 min of audio)
 make run     # live mic dictation (requires arecord)
 ```
 
