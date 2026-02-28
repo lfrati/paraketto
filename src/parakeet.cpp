@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 
+#include <mutex>
 #include <thread>
 
 #include <fcntl.h>
@@ -28,6 +29,7 @@
 #include <cuda_runtime.h>
 #include <cufft.h>
 #include "NvInfer.h"
+#include "cpp-httplib/httplib.h"
 
 // ---------------------------------------------------------------------------
 // Constants — match NeMo Parakeet TDT 0.6B V2 preprocessor
@@ -184,6 +186,48 @@ static WavData read_wav(const std::string& path) {
         memcpy(wav.samples.data(), raw_data.data(), data_size);
     } else {
         fprintf(stderr, "Unsupported fmt=%d bits=%d\n", audio_format, bits_per_sample); std::exit(1);
+    }
+    return wav;
+}
+
+static WavData read_wav_from_memory(const char* buf, size_t len) {
+    if (len < 44) return {};
+    if (memcmp(buf, "RIFF", 4) || memcmp(buf + 8, "WAVE", 4)) return {};
+
+    uint16_t audio_format = 0, num_channels = 0, bits_per_sample = 0;
+    uint32_t sample_rate = 0, data_size = 0;
+    const char* raw_data = nullptr;
+
+    size_t pos = 12;
+    while (pos + 8 <= len) {
+        const char* id = buf + pos;
+        uint32_t sz; memcpy(&sz, buf + pos + 4, 4);
+        pos += 8;
+        if (!memcmp(id, "fmt ", 4) && pos + 16 <= len) {
+            memcpy(&audio_format, buf + pos, 2);
+            memcpy(&num_channels, buf + pos + 2, 2);
+            memcpy(&sample_rate, buf + pos + 4, 4);
+            memcpy(&bits_per_sample, buf + pos + 14, 2);
+        } else if (!memcmp(id, "data", 4)) {
+            data_size = sz; raw_data = buf + pos;
+            if (pos + sz > len) data_size = len - pos;
+        }
+        pos += sz;
+    }
+
+    if (!raw_data || num_channels != 1 || sample_rate != 16000) return {};
+
+    WavData wav;
+    wav.sample_rate = sample_rate;
+    if (audio_format == 1 && bits_per_sample == 16) {
+        int n = data_size / 2; wav.samples.resize(n);
+        auto* src = (const int16_t*)raw_data;
+        for (int i = 0; i < n; i++) wav.samples[i] = src[i] / 32768.0f;
+    } else if (audio_format == 3 && bits_per_sample == 32) {
+        int n = data_size / 4; wav.samples.resize(n);
+        memcpy(wav.samples.data(), raw_data, data_size);
+    } else {
+        return {};
     }
     return wav;
 }
@@ -880,26 +924,137 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// HTTP server mode
+// ---------------------------------------------------------------------------
+
+static std::string json_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:   out += c;
+        }
+    }
+    return out;
+}
+
+static thread_local std::string t_log_detail;
+
+static void log_request(const httplib::Request& req, const httplib::Response& res) {
+    auto now = std::chrono::system_clock::now();
+    auto tt = std::chrono::system_clock::to_time_t(now);
+    struct tm tm;
+    localtime_r(&tt, &tm);
+    char ts[20];
+    strftime(ts, sizeof(ts), "%H:%M:%S", &tm);
+
+    fprintf(stderr, "%s  %s %s  %d\n", ts, req.method.c_str(), req.path.c_str(), res.status);
+
+    if (!t_log_detail.empty()) {
+        fprintf(stderr, "         %s\n", t_log_detail.c_str());
+        t_log_detail.clear();
+    }
+}
+
+static void run_server(Pipeline& pipeline, const std::string& host, int port) {
+    httplib::Server svr;
+    std::mutex mtx;
+
+    svr.set_logger(log_request);
+
+    svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content("{\"status\":\"ok\"}", "application/json");
+    });
+
+    svr.Post("/transcribe", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!req.has_file("file")) {
+            res.status = 400;
+            res.set_content("{\"error\":\"missing 'file' field\"}", "application/json");
+            return;
+        }
+        const auto& file = req.get_file_value("file");
+        auto wav = read_wav_from_memory(file.content.data(), file.content.size());
+        if (wav.samples.empty()) {
+            res.status = 400;
+            res.set_content("{\"error\":\"invalid WAV (need 16kHz mono, int16/float32)\"}", "application/json");
+            return;
+        }
+
+        double audio_dur = (double)wav.samples.size() / wav.sample_rate;
+        auto t0 = std::chrono::high_resolution_clock::now();
+        std::string text;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            text = pipeline.transcribe(wav.samples.data(), wav.samples.size());
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double elapsed = std::chrono::duration<double>(t1 - t0).count();
+
+        // Stash detail for the logger callback (same thread)
+        std::string preview = text.substr(0, 80);
+        if (text.size() > 80) preview += "...";
+        char detail[256];
+        snprintf(detail, sizeof(detail), "audio=%.1fs  inference=%.0fms  RTFx=%.0fx  \"%s\"",
+                 audio_dur, elapsed * 1000, audio_dur / elapsed, preview.c_str());
+        t_log_detail = detail;
+
+        char body[4096];
+        snprintf(body, sizeof(body),
+                 "{\"text\":\"%s\",\"audio_duration_s\":%.2f,\"inference_time_s\":%.4f}",
+                 json_escape(text).c_str(), audio_dur, elapsed);
+        res.set_content(body, "application/json");
+    });
+
+    const char* display_host = (host == "0.0.0.0") ? "localhost" : host.c_str();
+    fprintf(stderr, "listening on http://%s:%d\n", display_host, port);
+    fprintf(stderr, "\n");
+    if (!svr.listen(host, port)) {
+        fprintf(stderr, "failed to bind %s:%d\n", host.c_str(), port);
+        std::exit(1);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s [--engine-dir DIR] <wav_file>...\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--engine-dir DIR] [--server [[host]:port]] <wav_file>...\n", argv[0]);
         return 1;
     }
 
     std::string engine_dir = "engines";
     std::vector<std::string> wav_files;
+    bool server_mode = false;
+    std::string server_host = "0.0.0.0";
+    int server_port = 8080;
 
     for (int i = 1; i < argc; i++) {
-        if (std::string(argv[i]) == "--engine-dir" && i + 1 < argc)
+        std::string arg = argv[i];
+        if (arg == "--engine-dir" && i + 1 < argc) {
             engine_dir = argv[++i];
-        else
-            wav_files.push_back(argv[i]);
+        } else if (arg == "--server") {
+            server_mode = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                std::string addr = argv[++i];
+                auto colon = addr.rfind(':');
+                if (colon != std::string::npos) {
+                    if (colon > 0) server_host = addr.substr(0, colon);
+                    server_port = std::stoi(addr.substr(colon + 1));
+                }
+            }
+        } else {
+            wav_files.push_back(arg);
+        }
     }
 
-    if (wav_files.empty()) {
+    if (!server_mode && wav_files.empty()) {
         fprintf(stderr, "No WAV files specified.\n");
         return 1;
     }
@@ -911,8 +1066,8 @@ int main(int argc, char** argv) {
     cudaFree(0);
     auto t_cuda_init = clk::now();
 
-    // Hint kernel to pre-cache the first WAV file while engines load
-    {
+    if (!server_mode) {
+        // Hint kernel to pre-cache the first WAV file while engines load
         int wav_fd = open(wav_files[0].c_str(), O_RDONLY);
         if (wav_fd >= 0) { posix_fadvise(wav_fd, 0, 0, POSIX_FADV_WILLNEED); close(wav_fd); }
     }
@@ -921,7 +1076,46 @@ int main(int argc, char** argv) {
     pipeline.init(engine_dir);
     auto t_init_done = clk::now();
 
-    // Warmup with first file (result is discarded, only for CUDA/TRT priming)
+    if (server_mode) {
+        // Warmup with 1s of silence
+        std::vector<float> silence(16000, 0.0f);
+        pipeline.transcribe(silence.data(), silence.size());
+        auto t_warmup_done = clk::now();
+
+        auto ms = [](auto a, auto b) { return std::chrono::duration<double,std::milli>(b-a).count(); };
+
+        // CUDA device info
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, 0);
+        size_t vram_free, vram_total;
+        cudaMemGetInfo(&vram_free, &vram_total);
+
+        // Engine file sizes
+        auto file_size_mb = [](const std::string& path) -> double {
+            struct stat st;
+            return (stat(path.c_str(), &st) == 0) ? st.st_size / (1024.0 * 1024.0) : 0;
+        };
+        double enc_mb = file_size_mb(engine_dir + "/encoder.engine");
+        double dec_mb = file_size_mb(engine_dir + "/decoder_joint.engine");
+
+        fprintf(stderr, "\n");
+        fprintf(stderr, "model:     parakeet-tdt-0.6b-v2\n");
+        fprintf(stderr, "engines:   %s (encoder %.0f MB, decoder %.0f MB)\n",
+                engine_dir.c_str(), enc_mb, dec_mb);
+        fprintf(stderr, "device:    %s (compute %d.%d, %.0f MB VRAM, %.0f MB free)\n",
+                prop.name, prop.major, prop.minor,
+                vram_total / (1024.0 * 1024.0), vram_free / (1024.0 * 1024.0));
+        fprintf(stderr, "startup:   %.0f ms (cuda_init=%.0f engines=%.0f warmup=%.0f)\n",
+                ms(t_main_start, t_warmup_done), ms(t_main_start, t_cuda_init),
+                ms(t_cuda_init, t_init_done), ms(t_init_done, t_warmup_done));
+        fprintf(stderr, "endpoints: GET /health | POST /transcribe\n");
+        fprintf(stderr, "\n");
+
+        run_server(pipeline, server_host, server_port);
+        return 0;
+    }
+
+    // CLI mode: warmup with first file
     auto warmup_wav = read_wav(wav_files[0]);
     auto t_wav_read = clk::now();
     pipeline.transcribe(warmup_wav.samples.data(), warmup_wav.samples.size());

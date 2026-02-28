@@ -452,39 +452,37 @@ Replaced the hand-rolled radix-2 Cooley-Tukey FFT with cuFFT's batched R2C trans
 
 The flow: CPU pre-emphasis and windowing → upload windowed frames to GPU → `cufftPlanMany` + `cufftExecR2C` → download complex output → CPU power spectrum, sparse mel, log, normalize.
 
-Long-audio mel time: 42.9ms → 28.4ms (1.5x faster). Total RTFx: 918x → **1049x**.
+Long-audio mel time: 42.9ms → 28.4ms (1.5x faster). Total RTFx: 918x → **836x** (on RTX 5070 Ti; original measurement was on different hardware).
 
 ### Final Results
 
+Benchmarked on RTX 5070 Ti (compute 12.0):
+
 ```
 C++ (parakeet.cpp):
-  librispeech: WER=1.81% RTFx=827x (40 utts, 276s audio)
-  earnings22:  WER=16.48% RTFx=796x (40 utts, 253s audio)
-  long-audio:  RTFx=1049x (92s audio, 87ms)
+  librispeech: WER=1.81% RTFx=620x (40 utts, 276s audio)
+  earnings22:  WER=16.48% RTFx=643x (40 utts, 253s audio)
+  long-audio:  RTFx=836x (92s audio, 110ms)
 
 Python (parakeet_trt.py via onnx-asr):
-  librispeech: WER=1.81% RTFx=529x (40 utts, 276s audio)
-  earnings22:  WER=16.48% RTFx=603x (40 utts, 253s audio)
-  long-audio:  RTFx=874x (92s audio, 105ms)
+  librispeech: WER=1.81% RTFx=436x (40 utts, 276s audio)
+  earnings22:  WER=16.48% RTFx=458x (40 utts, 253s audio)
+  long-audio:  RTFx=672x (92s audio, 136ms)
 ```
 
-WER matches Python exactly on both datasets. The C++ binary is **20% faster** on long-audio and **~50% faster** on short clips (no Python/ORT overhead per utterance). Non-16kHz audio is rejected at load time (the model expects 16kHz input).
+WER matches Python exactly on both datasets. The C++ binary is **~24% faster** on long-audio and **~40% faster** on short utterances (no Python/ORT overhead per file). Non-16kHz audio is rejected at load time (the model expects 16kHz input).
 
 ### Architecture
 
 ```
-src/parakeet.cpp     # ~550 lines, single file
+src/parakeet.cpp     # ~1150 lines, single file (includes HTTP server)
 engines/
   encoder.engine     # 1.2 GB, FP16
   decoder_joint.engine  # 18 MB, FP16
-model/
-  vocab.txt          # 1025 BPE tokens
-  hann_window.bin    # 512 floats
-  mel_filterbank.bin # 257x128 floats
 Makefile
 ```
 
-Pipeline: WAV → CPU mel spectrogram → GPU TRT encoder → GPU TRT decoder (greedy TDT loop) → BPE detokenize → text
+Vocab, Hann window, and mel filterbank weights are embedded directly in the source (no external data files). Pipeline: WAV → CPU mel spectrogram (cuFFT) → GPU TRT encoder → GPU TRT decoder (greedy TDT loop) → BPE detokenize → text
 
 ### Step 8: Startup Time Optimization
 
@@ -532,3 +530,35 @@ cold: 1129ms total (cuda_init=299 engines=805 mel+stream=7 bufs=0, warmup=17)
 | Encoder load (warm) | 846ms | 308ms | **-538ms (-64%)** |
 
 The remaining 310ms of engine load is TRT deserialization — internal to TensorRT, it rebuilds GPU kernel launch parameters from the serialized plan. The 106ms CUDA driver init is a per-process cost. These are the floor without moving to a persistent server process or using TRT's `ITimingCache`.
+
+### Step 9: HTTP Server Mode
+
+Startup takes ~584ms (CUDA init + loading 1.2GB TRT engines), so spawning a process per request is unacceptable for production use. Adding a persistent HTTP server mode keeps the Pipeline loaded in memory and amortizes startup across all requests.
+
+**Implementation:** Embedded [cpp-httplib](https://github.com/yhirose/cpp-httplib) (v0.18.3), the same header-only library llama.cpp uses for llama-server. ~100 lines added to `parakeet.cpp`:
+
+- `read_wav_from_memory()` — WAV chunk parsing on a buffer instead of ifstream, for multipart uploads
+- `run_server()` — two endpoints: `GET /health` and `POST /transcribe` (multipart file upload)
+- `std::mutex` around `pipeline.transcribe()` — serializes GPU access while keeping `/health` responsive
+- `--server [[host]:port]` flag with sensible defaults (`0.0.0.0:8080`)
+
+The server matches the API of our existing Python stt-server (`stt_server.py`), returning `{"text":"...","audio_duration_s":...,"inference_time_s":...}` — making it a drop-in replacement.
+
+**Startup banner:**
+```
+model:     parakeet-tdt-0.6b-v2
+engines:   engines (encoder 1185 MB, decoder 17 MB)
+device:    NVIDIA GeForce RTX 5070 Ti (compute 12.0, 15842 MB VRAM, 13967 MB free)
+startup:   584 ms (cuda_init=198 engines=368 warmup=17)
+endpoints: GET /health | POST /transcribe
+
+listening on http://localhost:8080
+```
+
+**Request logging:**
+```
+18:33:12  POST /transcribe  200
+         audio=3.5s  inference=9ms  RTFx=398x  "Concord returned to its place amidst the tents."
+```
+
+The benchmark (`tests/bench_cpp.py`) was also rewritten to use the server endpoint instead of parsing stderr — simpler and more accurate since inference timing comes from the JSON response rather than regex-matching log lines. This fixed an off-by-one bug where the `init:` log line was being matched as a file timing entry, skewing per-dataset RTFx numbers.

@@ -1,23 +1,27 @@
 """Benchmark the C++ parakeet binary: WER and RTFx.
 
-Runs the C++ binary on all utterances from data/{librispeech,earnings22}/manifest.json
-in a single invocation, reports per-dataset WER and RTFx, plus long-audio RTFx.
+Starts the parakeet HTTP server, sends all utterances from
+data/{librispeech,earnings22}/manifest.json via /transcribe,
+reports per-dataset WER and RTFx, plus long-audio RTFx.
 
 Usage:
     uv run python tests/bench_cpp.py
 """
 
 import json
-import re
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
+import requests
 from jiwer import Compose, ReduceToListOfListOfWords, RemovePunctuation, ToLowerCase, wer
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 BINARY = ROOT / "parakeet"
+SERVER_URL = "http://localhost:18080"
 
 _normalize = Compose([ToLowerCase(), RemovePunctuation(), ReduceToListOfListOfWords()])
 
@@ -33,70 +37,83 @@ def load_manifest(name: str) -> list[dict]:
     return manifest
 
 
+def transcribe(path: str) -> dict:
+    with open(path, "rb") as f:
+        r = requests.post(f"{SERVER_URL}/transcribe", files={"file": f})
+    r.raise_for_status()
+    return r.json()
+
+
+def wait_for_server(timeout: float = 30) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            r = requests.get(f"{SERVER_URL}/health", timeout=1)
+            if r.ok:
+                return
+        except requests.ConnectionError:
+            pass
+        time.sleep(0.1)
+    print("Server failed to start", file=sys.stderr)
+    sys.exit(1)
+
+
 def main():
     if not BINARY.exists():
         print(f"Binary not found: {BINARY}", file=sys.stderr)
         print("Run 'make parakeet' first.", file=sys.stderr)
         sys.exit(1)
 
-    # Collect all files across datasets, then run once
-    datasets = []
-    all_paths = []
-    for name in DATASETS:
-        manifest = load_manifest(name)
-        datasets.append((name, manifest))
-        all_paths.extend(e["audio_path"] for e in manifest)
-
-    # Single invocation for all files (first file is warmup internally)
-    result = subprocess.run(
-        [str(BINARY)] + all_paths,
-        capture_output=True, text=True,
+    # Start server
+    server = subprocess.Popen(
+        [str(BINARY), "--server", ":18080"],
+        stderr=subprocess.PIPE,
     )
-    if result.returncode != 0:
-        print(f"Error: {result.stderr}", file=sys.stderr)
-        sys.exit(1)
+    try:
+        wait_for_server()
 
-    hypotheses = result.stdout.strip().split("\n")
+        # Warmup
+        manifest = load_manifest(DATASETS[0])
+        transcribe(manifest[0]["audio_path"])
 
-    # Parse per-file timing from stderr (format: "6.9s audio, 5.2ms (...), 1327x RTFx")
-    stderr_lines = result.stderr.strip().split("\n")
-    file_times_ms = []
-    for line in stderr_lines:
-        m = re.search(r"([\d.]+)ms \(", line)
-        if m:
-            file_times_ms.append(float(m.group(1)))
+        # Bench each dataset
+        total_audio = 0.0
+        total_inference = 0.0
+        for name in DATASETS:
+            manifest = load_manifest(name)
+            ds_audio = sum(e["duration_s"] for e in manifest)
+            ds_inference = 0.0
+            references = []
+            hypotheses = []
 
-    # Split results per dataset
-    offset = 0
-    for name, manifest in datasets:
-        n = len(manifest)
-        total_audio = sum(e["duration_s"] for e in manifest)
-        references = [e["reference"] for e in manifest]
-        hyps = hypotheses[offset:offset + n]
-        times = file_times_ms[offset:offset + n]
-        offset += n
+            for entry in manifest:
+                result = transcribe(entry["audio_path"])
+                hypotheses.append(result["text"])
+                references.append(entry["reference"])
+                ds_inference += result["inference_time_s"]
 
-        wer_pct = wer(
-            references, hyps,
-            reference_transform=_normalize,
-            hypothesis_transform=_normalize,
-        ) * 100
-        elapsed = sum(times) / 1000
-        rtfx = total_audio / elapsed if elapsed > 0 else 0
+            wer_pct = wer(
+                references, hypotheses,
+                reference_transform=_normalize,
+                hypothesis_transform=_normalize,
+            ) * 100
+            rtfx = ds_audio / ds_inference if ds_inference > 0 else 0
+            print(f"{name}: WER={wer_pct:.2f}% RTFx={rtfx:.0f}x ({len(manifest)} utts, {ds_audio:.0f}s audio)")
 
-        print(f"{name}: WER={wer_pct:.2f}% RTFx={rtfx:.0f}x ({n} utts, {total_audio:.0f}s audio)")
+            total_audio += ds_audio
+            total_inference += ds_inference
 
-    total_audio = sum(e["duration_s"] for m in [d[1] for d in datasets] for e in m)
-    total_elapsed = sum(file_times_ms) / 1000
-    print(f"total: {total_audio:.0f}s audio in {total_elapsed*1000:.0f}ms, {total_audio/total_elapsed:.0f}x RTFx")
+        print(f"total: {total_audio:.0f}s audio in {total_inference*1000:.0f}ms, {total_audio/total_inference:.0f}x RTFx")
 
-    # Long-audio RTFx (separate invocation — includes its own warmup)
-    result = subprocess.run(
-        [str(BINARY), str(LONG_AUDIO)],
-        capture_output=True, text=True,
-    )
-    stderr = result.stderr.strip().split("\n")[-1]
-    print(f"long-audio: {stderr}")
+        # Long-audio
+        result = transcribe(str(LONG_AUDIO))
+        audio_s = result["audio_duration_s"]
+        inf_s = result["inference_time_s"]
+        print(f"long-audio: {audio_s:.1f}s audio, {inf_s*1000:.1f}ms, {audio_s/inf_s:.0f}x RTFx")
+
+    finally:
+        server.send_signal(signal.SIGINT)
+        server.wait(timeout=5)
 
 
 if __name__ == "__main__":

@@ -6,8 +6,8 @@ CUDA_HOME      ?= /usr/local/cuda-13.1
 export LD_LIBRARY_PATH := $(TRT_LIBS):$(VENV_PKGS)/onnxruntime/capi:$(LD_LIBRARY_PATH)
 
 CXX      = g++
-CXXFLAGS = -std=c++17 -O3 -march=native -flto -Wno-deprecated-declarations -I$(TRT_INCLUDE) -I$(CUDA_HOME)/include
-LDFLAGS  = -flto -L$(CUDA_HOME)/lib64 -lcudart -lcufft $(TRT_LIBS)/libnvinfer.so.10 -Wl,-rpath,$(TRT_LIBS)
+CXXFLAGS = -std=c++17 -O3 -march=native -flto=auto -Wno-deprecated-declarations -I$(TRT_INCLUDE) -I$(CUDA_HOME)/include -Ithird_party
+LDFLAGS  = -flto=auto -L$(CUDA_HOME)/lib64 -lcudart -lcufft -lpthread $(TRT_LIBS)/libnvinfer.so.10 -Wl,-rpath,$(TRT_LIBS)
 
 .PHONY: run bench bench-cpp engines
 
