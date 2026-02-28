@@ -721,7 +721,7 @@ void add_pos_bias_dual_fp16(const half* q,
 
 __global__ void rel_pos_skew_kernel(const half* __restrict__ in,
                                     half* __restrict__ out,
-                                    int heads, int T) {
+                                    int heads, int T, float scale) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = heads * T * T;
     if (idx < total) {
@@ -732,7 +732,8 @@ __global__ void rel_pos_skew_kernel(const half* __restrict__ in,
         // Input column for position (t, j): j + (T - 1 - t)
         int src_col = j + T - 1 - t;
         int W = 2 * T - 1;
-        out[idx] = in[h * T * W + t * W + src_col];
+        float val = __half2float(in[h * T * W + t * W + src_col]);
+        out[idx] = __float2half(val * scale);
     }
 }
 
@@ -741,7 +742,15 @@ void rel_pos_skew_fp16(const half* pos_scores, half* out,
     int total = heads * T * T;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    rel_pos_skew_kernel<<<blocks, threads, 0, stream>>>(pos_scores, out, heads, T);
+    rel_pos_skew_kernel<<<blocks, threads, 0, stream>>>(pos_scores, out, heads, T, 1.0f);
+}
+
+void rel_pos_skew_scale_fp16(const half* pos_scores, half* out,
+                              int heads, int T, float scale, cudaStream_t stream) {
+    int total = heads * T * T;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    rel_pos_skew_kernel<<<blocks, threads, 0, stream>>>(pos_scores, out, heads, T, scale);
 }
 
 // ---------------------------------------------------------------------------
@@ -1080,3 +1089,4 @@ void split_transpose_3way_fp16(const half* in,
     split_transpose_3way_kernel<<<blocks, threads, 0, stream>>>(
         in, out0, out1, out2, T, heads, head_dim);
 }
+

@@ -49,12 +49,12 @@ src/cutlass_kernels.o: src/cutlass_kernels.cu src/cutlass_kernels.h
 	$(NVCC) -std=c++17 -O3 -I$(CUDA_HOME)/include -Isrc -Ithird_party/cutlass/include --expt-relaxed-constexpr -gencode arch=compute_80,code=compute_80 -c $< -o $@
 
 # TRT backend (reference)
-parakeet: src/parakeet.cpp src/conformer.cpp src/conformer.h src/kernels.o src/kernels.h
-	$(CXX) $(CXXFLAGS) src/parakeet.cpp src/conformer.cpp src/kernels.o $(LDFLAGS) -o $@
+parakeet: src/parakeet.cpp src/kernels.o src/kernels.h
+	$(CXX) $(CXXFLAGS) src/parakeet.cpp src/kernels.o $(LDFLAGS) -o $@
 
 # CUDA backend (no TensorRT dependency)
-CUDA_CXXFLAGS = -std=c++17 -O3 -march=native -flto=auto -Wno-deprecated-declarations -I$(CUDA_HOME)/include -Ithird_party -Isrc
-CUDA_LDFLAGS  = -flto=auto -L$(CUDA_HOME)/lib64 -lcudart -lcufft -lcublas -lcublasLt -lpthread
+CUDA_CXXFLAGS = -std=c++17 -O3 -march=native -flto=auto -Wno-deprecated-declarations -I$(CUDA_HOME)/include -I/usr/include/x86_64-linux-gnu -Ithird_party/cudnn-frontend/include -Ithird_party -Isrc
+CUDA_LDFLAGS  = -flto=auto -L$(CUDA_HOME)/lib64 -lcudart -lcufft -lcublas -lcublasLt -lcudnn -lpthread
 
 parakeet_cuda: src/parakeet_cuda.cpp src/conformer.cpp src/conformer.h src/kernels.o src/kernels.h
 	$(CXX) $(CUDA_CXXFLAGS) src/parakeet_cuda.cpp src/conformer.cpp src/kernels.o $(CUDA_LDFLAGS) -o $@

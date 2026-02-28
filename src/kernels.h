@@ -166,6 +166,10 @@ void add_pos_bias_dual_fp16(const half* q,
 void rel_pos_skew_fp16(const half* pos_scores, half* out,
                        int heads, int T, cudaStream_t stream);
 
+// Same as above but also scales output by a factor (used for cuDNN SDPA bias pre-scaling)
+void rel_pos_skew_scale_fp16(const half* pos_scores, half* out,
+                              int heads, int T, float scale, cudaStream_t stream);
+
 // Scale + add two score matrices: out = (content + position) / sqrt(head_dim)
 void scale_add_scores_fp16(const half* content, const half* position,
                            half* out, int heads, int T, float scale,

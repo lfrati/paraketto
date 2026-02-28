@@ -20,6 +20,15 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cudnn_frontend.h>
+namespace fe = cudnn_frontend;
+
+// cuDNN SDPA tensor UIDs
+enum SdpaUid : int64_t {
+    SDPA_Q = 1, SDPA_K = 2, SDPA_V = 3,
+    SDPA_O = 4, SDPA_STATS = 5, SDPA_BIAS = 6
+};
+
 // ---------------------------------------------------------------------------
 // CUDA error checking (same macro as parakeet.cpp)
 // ---------------------------------------------------------------------------
@@ -342,6 +351,82 @@ static half* alloc_fp16(size_t count) {
 }
 
 // ---------------------------------------------------------------------------
+// cuDNN SDPA graph builder + cache (keyed by T)
+// ---------------------------------------------------------------------------
+
+struct SdpaGraph {
+    std::shared_ptr<fe::graph::Graph> graph;
+    int64_t workspace_size = 0;
+};
+
+static std::unordered_map<int, SdpaGraph> sdpa_cache;
+
+static SdpaGraph& get_sdpa_graph(cudnnHandle_t cudnn, int T) {
+    auto it = sdpa_cache.find(T);
+    if (it != sdpa_cache.end()) return it->second;
+
+    int64_t b = 1, h = N_HEADS, s = T, d = HEAD_DIM;
+    float scale = 1.0f / sqrtf((float)HEAD_DIM);
+
+    auto graph = std::make_shared<fe::graph::Graph>();
+    graph->set_io_data_type(fe::DataType_t::HALF)
+         .set_intermediate_data_type(fe::DataType_t::FLOAT)
+         .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    // Q, K, V: [1, H, T, D] with H-major layout [H, T, D] contiguous
+    auto Q = graph->tensor(fe::graph::Tensor_attributes()
+        .set_name("Q").set_uid(SDPA_Q)
+        .set_dim({b, h, s, d})
+        .set_stride({h*s*d, s*d, d, 1}));
+
+    auto K = graph->tensor(fe::graph::Tensor_attributes()
+        .set_name("K").set_uid(SDPA_K)
+        .set_dim({b, h, s, d})
+        .set_stride({h*s*d, s*d, d, 1}));
+
+    auto V = graph->tensor(fe::graph::Tensor_attributes()
+        .set_name("V").set_uid(SDPA_V)
+        .set_dim({b, h, s, d})
+        .set_stride({h*s*d, s*d, d, 1}));
+
+    // Additive bias: [1, H, T, T] — per-head relative position bias
+    auto Bias = graph->tensor(fe::graph::Tensor_attributes()
+        .set_name("Bias").set_uid(SDPA_BIAS)
+        .set_dim({b, h, s, s})
+        .set_stride({h*s*s, s*s, s, 1}));
+
+    auto sdpa_opts = fe::graph::SDPA_attributes()
+        .set_name("flash_attention")
+        .set_attn_scale(scale)
+        .set_bias(Bias)
+        .set_generate_stats(false);
+
+    auto [O, Stats] = graph->sdpa(Q, K, V, sdpa_opts);
+
+    // Output: [1, H, T, D] with S-major layout [T, H, D] contiguous
+    // This lets us skip the transpose_0213 after attention
+    O->set_output(true)
+      .set_dim({b, h, s, d})
+      .set_stride({s*h*d, d, h*d, 1})
+      .set_uid(SDPA_O);
+
+    auto status = graph->build(cudnn, {fe::HeurMode_t::A});
+    if (!status.is_good()) {
+        fprintf(stderr, "cuDNN SDPA graph build failed for T=%d: %s\n",
+                T, status.get_message().c_str());
+        // Return an entry with null graph to signal failure
+        auto& entry = sdpa_cache[T];
+        entry.graph = nullptr;
+        return entry;
+    }
+
+    auto& entry = sdpa_cache[T];
+    entry.graph = graph;
+    graph->get_workspace_size(entry.workspace_size);
+    return entry;
+}
+
+// ---------------------------------------------------------------------------
 // CudaModel::init
 // ---------------------------------------------------------------------------
 
@@ -415,6 +500,20 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
     conv_mid = alloc_fp16(T_max * D_CONV_PW);
     conv_glu = alloc_fp16(T_max * D_MODEL);
     conv_dw  = alloc_fp16(T_max * D_MODEL);
+    pos_bias = alloc_fp16(N_HEADS * T_max * T_max);
+
+    // cuDNN flash attention
+    auto cudnn_status = cudnnCreate(&cudnn);
+    if (cudnn_status != CUDNN_STATUS_SUCCESS) {
+        fprintf(stderr, "cudnnCreate failed: %s\n", cudnnGetErrorString(cudnn_status));
+        cudnn = nullptr;
+    } else {
+        cudnnSetStream(cudnn, stream);
+        // Pre-build SDPA graph for warmup T (actual T built lazily)
+        sdpa_workspace_size = 32 * 1024 * 1024;  // 32MB initial
+        CUDA_CHECK(cudaMalloc(&sdpa_workspace, sdpa_workspace_size));
+        CUDA_CHECK(cudaMalloc(&sdpa_stats, N_HEADS * T_max * sizeof(float)));
+    }
 
     // Decoder buffers
     dec_embed  = alloc_fp16(D_PRED);
@@ -494,7 +593,11 @@ void CudaModel::free() {
         if (qkv_w[b]) { cudaFree(qkv_w[b]); qkv_w[b] = nullptr; }
     }
     f(q_u); f(q_v_buf); f(scores); f(pos_scores); f(attn_out); f(mhsa_out);
-    f(conv_mid); f(conv_glu); f(conv_dw);
+    f(conv_mid); f(conv_glu); f(conv_dw); f(pos_bias);
+    if (sdpa_stats) { cudaFree(sdpa_stats); sdpa_stats = nullptr; }
+    if (sdpa_workspace) { cudaFree(sdpa_workspace); sdpa_workspace = nullptr; }
+    sdpa_cache.clear();
+    if (cudnn) { cudnnDestroy(cudnn); cudnn = nullptr; }
     f(dec_embed); f(lstm_gates);
     f(lstm_h[0]); f(lstm_h[1]); f(lstm_c[0]); f(lstm_c[1]);
     f(lstm_h_out[0]); f(lstm_h_out[1]); f(lstm_c_out[0]); f(lstm_c_out[1]);
@@ -741,31 +844,57 @@ int CudaModel::encode(const float* mel_fp32_host, int T_mel) {
             add_pos_bias_dual_fp16(Q_h, b.pos_bias_u, b.pos_bias_v,
                                     q_u, q_v_buf, N_HEADS, T, HEAD_DIM, stream);
 
-            // Content scores: [8, T, T] = q_u[8, T, 128] @ K[8, T, 128]^T
-            batched_gemm_nt(cublas, q_u, K_h, scores,
-                            N_HEADS, T, T, HEAD_DIM,
-                            (long long)T * HEAD_DIM, (long long)T * HEAD_DIM, (long long)T * T);
-
             // Position scores: [8, T, pos_len] = q_v[8, T, 128] @ pos[8, pos_len, 128]^T
             batched_gemm_nt(cublas, q_v_buf, pos_proj, pos_scores,
                             N_HEADS, T, pos_len, HEAD_DIM,
                             (long long)T * HEAD_DIM, (long long)pos_len * HEAD_DIM,
                             (long long)T * pos_len);
 
-            // Fused skew + scale + softmax (3 kernels → 1)
+            // Skew position scores: [8, T, 2T-1] → [8, T, T]
+            // Pre-scale by 1/sqrt(d) so cuDNN SDPA's (Q×K^T×scale + bias) matches
+            // our original (Q×K^T + bias)×scale
             float scale = 1.0f / sqrtf((float)HEAD_DIM);
-            fused_score_softmax_fp16(scores, pos_scores, scores,
-                                      N_HEADS, T, scale, stream);
+            rel_pos_skew_scale_fp16(pos_scores, pos_bias, N_HEADS, T, scale, stream);
 
-            // Weighted sum: [8, T, 128] = scores[8, T, T] @ V[8, T, 128]
-            batched_gemm_nn(cublas, scores, V_h, attn_out,
-                            N_HEADS, T, HEAD_DIM, T,
-                            (long long)T * T, (long long)T * HEAD_DIM, (long long)T * HEAD_DIM);
+            // cuDNN Flash Attention: fuses content_scores + add_bias + scale + softmax + weighted_sum
+            // Input Q=q_u, K, V in [H, T, D] layout; Bias=pos_bias in [H, T, T]
+            // Output directly in [T, H, D] layout (no transpose needed)
+            SdpaGraph& sg = get_sdpa_graph(cudnn, T);
+            if (sg.graph) {
+                // Ensure workspace is large enough
+                if (sg.workspace_size > (int64_t)sdpa_workspace_size) {
+                    cudaFree(sdpa_workspace);
+                    sdpa_workspace_size = sg.workspace_size;
+                    CUDA_CHECK(cudaMalloc(&sdpa_workspace, sdpa_workspace_size));
+                }
 
-            // Transpose attn_out back: [8, T, 128] → [T, 8, 128] = [T, 1024]
-            transpose_0213_fp16(attn_out, ff_out, N_HEADS, T, HEAD_DIM, stream);
+                std::unordered_map<int64_t, void*> variant_pack = {
+                    {SDPA_Q,    (void*)q_u},
+                    {SDPA_K,    (void*)K_h},
+                    {SDPA_V,    (void*)V_h},
+                    {SDPA_BIAS, (void*)pos_bias},
+                    {SDPA_O,    (void*)ff_out},  // output in [T, H, D] layout
+                };
+                auto status = sg.graph->execute(cudnn, variant_pack, sdpa_workspace);
+                if (!status.is_good()) {
+                    fprintf(stderr, "cuDNN SDPA execute failed (T=%d): %s\n",
+                            T, status.get_message().c_str());
+                }
+            } else {
+                // Fallback: original path without flash attention
+                batched_gemm_nt(cublas, q_u, K_h, scores,
+                                N_HEADS, T, T, HEAD_DIM,
+                                (long long)T * HEAD_DIM, (long long)T * HEAD_DIM, (long long)T * T);
+                float scale = 1.0f / sqrtf((float)HEAD_DIM);
+                fused_score_softmax_fp16(scores, pos_scores, scores,
+                                          N_HEADS, T, scale, stream);
+                batched_gemm_nn(cublas, scores, V_h, attn_out,
+                                N_HEADS, T, HEAD_DIM, T,
+                                (long long)T * T, (long long)T * HEAD_DIM, (long long)T * HEAD_DIM);
+                transpose_0213_fp16(attn_out, ff_out, N_HEADS, T, HEAD_DIM, stream);
+            }
 
-            // Output projection
+            // Output projection (ff_out is now [T, 1024] in both paths)
             gnn(ff_out, T, D_MODEL, b.out_w, D_MODEL, mhsa_out);
         }
 

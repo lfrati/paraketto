@@ -17,6 +17,7 @@
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
 #include <cublasLt.h>
+#include <cudnn.h>
 
 // ---------------------------------------------------------------------------
 // Weight file format constants
@@ -217,6 +218,13 @@ struct CudaModel {
     half* conv_mid   = nullptr;  // [T', D_CONV_PW]
     half* conv_glu   = nullptr;  // [T', D_MODEL]
     half* conv_dw    = nullptr;  // [T', D_MODEL]
+    half* pos_bias   = nullptr;  // [N_HEADS, T', T'] — materialized position bias for SDPA
+    float* sdpa_stats = nullptr; // [1, N_HEADS, T', 1] — SDPA stats output
+    void* sdpa_workspace = nullptr;
+    size_t sdpa_workspace_size = 0;
+
+    // --- cuDNN flash attention ---
+    cudnnHandle_t cudnn = nullptr;
 
     // --- Decoder buffers (FP16) ---
     half* dec_embed  = nullptr;  // [D_PRED]
