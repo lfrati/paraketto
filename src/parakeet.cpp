@@ -18,6 +18,13 @@
 #include <string>
 #include <vector>
 
+#include <thread>
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <cuda_runtime.h>
 #include <cufft.h>
 #include "NvInfer.h"
@@ -92,13 +99,20 @@ struct Engine {
 
     static Engine load(const std::string& path) {
         Engine e;
-        std::ifstream f(path, std::ios::binary | std::ios::ate);
-        if (!f) { fprintf(stderr, "Cannot open engine: %s\n", path.c_str()); std::exit(1); }
-        size_t size = f.tellg(); f.seekg(0);
-        std::vector<char> data(size);
-        f.read(data.data(), size);
+        int fd = open(path.c_str(), O_RDONLY);
+        if (fd < 0) { fprintf(stderr, "Cannot open engine: %s\n", path.c_str()); std::exit(1); }
+        struct stat st;
+        fstat(fd, &st);
+        size_t size = st.st_size;
+        void* data = mmap(nullptr, size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0);
+        if (data == MAP_FAILED) { fprintf(stderr, "mmap failed: %s\n", path.c_str()); close(fd); std::exit(1); }
+        madvise(data, size, MADV_SEQUENTIAL);
+
         e.runtime = {nvinfer1::createInferRuntime(gLogger), [](nvinfer1::IRuntime* r) { delete r; }};
-        e.engine = {e.runtime->deserializeCudaEngine(data.data(), size), [](nvinfer1::ICudaEngine* eng) { delete eng; }};
+        e.engine = {e.runtime->deserializeCudaEngine(data, size), [](nvinfer1::ICudaEngine* eng) { delete eng; }};
+
+        munmap(data, size);
+        close(fd);
         if (!e.engine) { fprintf(stderr, "Failed to deserialize: %s\n", path.c_str()); std::exit(1); }
         e.context = {e.engine->createExecutionContext(), [](nvinfer1::IExecutionContext* c) { delete c; }};
         return e;
@@ -703,10 +717,19 @@ struct Pipeline {
     GpuBuf d_dec_out, d_prednet_lens;
 
     void init(const std::string& engine_dir) {
+        using clk = std::chrono::high_resolution_clock;
+        auto t0 = clk::now();
+
+        // Load both engines in parallel
+        std::thread dec_thread([&]{ decoder_joint = Engine::load(engine_dir + "/decoder_joint.engine"); });
         encoder = Engine::load(engine_dir + "/encoder.engine");
-        decoder_joint = Engine::load(engine_dir + "/decoder_joint.engine");
+        dec_thread.join();
+        auto t_eng = clk::now();
+
         mel.init();
+        mel.ensure_fft(1000);  // Pre-create cuFFT plan for ~10s audio
         CUDA_CHECK(cudaStreamCreate(&stream));
+        auto t_mel = clk::now();
 
         d_length       = GpuBuf(sizeof(int64_t));
         d_enc_lens     = GpuBuf(sizeof(int64_t));
@@ -719,6 +742,11 @@ struct Pipeline {
         d_out_states2  = GpuBuf(2 * 640 * sizeof(float));
         d_dec_out      = GpuBuf(1030 * sizeof(float));
         d_prednet_lens = GpuBuf(sizeof(int32_t));
+        auto t_buf = clk::now();
+
+        auto ms = [](auto a, auto b) { return std::chrono::duration<double,std::milli>(b-a).count(); };
+        fprintf(stderr, "init: %.0fms (engines=%.0f mel+stream=%.0f bufs=%.0f)\n",
+                ms(t0,t_buf), ms(t0,t_eng), ms(t_eng,t_mel), ms(t_mel,t_buf));
     }
 
     ~Pipeline() { if (stream) cudaStreamDestroy(stream); }
@@ -876,16 +904,39 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    using clk = std::chrono::high_resolution_clock;
+    auto t_main_start = clk::now();
+
+    // Force CUDA driver/context initialization before anything else
+    cudaFree(0);
+    auto t_cuda_init = clk::now();
+
+    // Hint kernel to pre-cache the first WAV file while engines load
+    {
+        int wav_fd = open(wav_files[0].c_str(), O_RDONLY);
+        if (wav_fd >= 0) { posix_fadvise(wav_fd, 0, 0, POSIX_FADV_WILLNEED); close(wav_fd); }
+    }
+
     Pipeline pipeline;
     pipeline.init(engine_dir);
+    auto t_init_done = clk::now();
 
-    // Warmup with first file
+    // Warmup with first file (result is discarded, only for CUDA/TRT priming)
     auto warmup_wav = read_wav(wav_files[0]);
+    auto t_wav_read = clk::now();
     pipeline.transcribe(warmup_wav.samples.data(), warmup_wav.samples.size());
+    auto t_warmup_done = clk::now();
+
+    auto ms = [](auto a, auto b) { return std::chrono::duration<double,std::milli>(b-a).count(); };
+    fprintf(stderr, "startup: %.0fms total (cuda_init=%.0f init=%.0f wav_read=%.0f warmup=%.0f)\n",
+            ms(t_main_start, t_warmup_done), ms(t_main_start, t_cuda_init),
+            ms(t_cuda_init, t_init_done),
+            ms(t_init_done, t_wav_read), ms(t_wav_read, t_warmup_done));
 
     // Process each file
-    for (auto& path : wav_files) {
-        auto wav = read_wav(path);
+    for (size_t fi = 0; fi < wav_files.size(); fi++) {
+        // Reuse warmup WAV data for first file to avoid re-reading
+        WavData wav = (fi == 0) ? std::move(warmup_wav) : read_wav(wav_files[fi]);
         double audio_dur = (double)wav.samples.size() / wav.sample_rate;
 
         auto t0 = std::chrono::high_resolution_clock::now();

@@ -485,3 +485,50 @@ Makefile
 ```
 
 Pipeline: WAV → CPU mel spectrogram → GPU TRT encoder → GPU TRT decoder (greedy TDT loop) → BPE detokenize → text
+
+### Step 8: Startup Time Optimization
+
+The binary was taking ~880ms (warm cache) to ~1.6s (cold cache) to produce its first output. Profiling showed the encoder engine load dominated at 96% of startup time. We tried eight optimizations:
+
+**Baseline measurements:**
+```
+warm: 883ms total (enc=846 dec=13 mel+stream=4 bufs=0, warmup=17)
+cold: 1567ms total (enc=1453 dec=22 mel+stream=56 bufs=0, warmup=34)
+```
+
+#### What worked
+
+**mmap with MAP_POPULATE (the big win).** Replaced `std::ifstream` + `std::vector<char>` with `mmap(MAP_PRIVATE | MAP_POPULATE)` + `madvise(MADV_SEQUENTIAL)`. The old path heap-allocated 1.2GB, did a sequential `ifstream::read` copy into it, then TRT traversed the buffer again — three memory passes over 1.2GB. With mmap, TRT reads directly from the kernel page cache: zero copy, no heap allocation. Warm encoder load dropped from 846ms to 308ms (**-63%**).
+
+**Parallel engine loading.** Moved decoder_joint loading to a background `std::thread` so it overlaps with the encoder load. The decoder is only 18MB / ~6ms warm, so warm-cache benefit is negligible. But on cold cache the decoder's disk I/O overlaps with the encoder's, saving ~100ms.
+
+#### What helped marginally
+
+**Early `cudaFree(0)`.** Forces CUDA driver initialization (~106ms warm, ~300ms cold) before engine loading. This didn't reduce total time — CUDA init was already happening inside the first `deserializeCudaEngine` call. But it made the cost visible and separable, and prevents surprises if the init order changes.
+
+**Pre-create cuFFT plan.** Called `mel.ensure_fft(1000)` during init to build the cuFFT plan before the first transcription. Saved ~1ms from warmup. Negligible but zero-cost.
+
+**WAV readahead with `posix_fadvise`.** Hints the kernel to pre-cache the first WAV file while engines load. No measurable effect on test data (WAV files are ~110KB), but zero-cost insurance for large audio files.
+
+**Reuse warmup WAV data.** The first file was being read and transcribed twice — once for warmup (discarded), once for real output. Now `std::move`s the warmup WAV data into the processing loop, avoiding the redundant read and allocation.
+
+#### What didn't help
+
+**`-O3 -march=native -flto` compiler flags.** No measurable startup improvement — startup is I/O and TRT deserialization, not CPU compute. Kept the flags anyway since they benefit inference runtime (mel spectrogram vectorization, decoder argmax).
+
+**Pooling GPU buffer allocations (skipped).** The 11 separate `cudaMalloc` calls for decoder state buffers already took <0.5ms combined. Pooling into a single allocation would add complexity for no measurable gain.
+
+#### Final results
+
+```
+warm: 438ms total (cuda_init=106 engines=310 mel+stream=1 bufs=0, warmup=16)
+cold: 1129ms total (cuda_init=299 engines=805 mel+stream=7 bufs=0, warmup=17)
+```
+
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| Warm startup | 883ms | 438ms | **-445ms (-50%)** |
+| Cold startup | 1567ms | 1129ms | **-438ms (-28%)** |
+| Encoder load (warm) | 846ms | 308ms | **-538ms (-64%)** |
+
+The remaining 310ms of engine load is TRT deserialization — internal to TensorRT, it rebuilds GPU kernel launch parameters from the serialized plan. The 106ms CUDA driver init is a per-process cost. These are the floor without moving to a persistent server process or using TRT's `ITimingCache`.
