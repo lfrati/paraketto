@@ -7,7 +7,7 @@ export LD_LIBRARY_PATH := $(TRT_LIBS):$(VENV_PKGS)/onnxruntime/capi:$(LD_LIBRARY
 
 CXX      = g++
 CXXFLAGS = -std=c++17 -O2 -I$(TRT_INCLUDE) -I$(CUDA_HOME)/include
-LDFLAGS  = -L$(CUDA_HOME)/lib64 -lcudart $(TRT_LIBS)/libnvinfer.so.10 -Wl,-rpath,$(TRT_LIBS)
+LDFLAGS  = -L$(CUDA_HOME)/lib64 -lcudart -lcufft $(TRT_LIBS)/libnvinfer.so.10 -Wl,-rpath,$(TRT_LIBS)
 
 .PHONY: run bench bench-cpp
 

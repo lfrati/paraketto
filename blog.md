@@ -466,6 +466,42 @@ Python (parakeet_trt.py):
 
 C++ is now **faster than Python** on long-audio throughput (918x vs 848x RTFx), despite doing the mel spectrogram on CPU instead of GPU. The remaining mel bottleneck (43ms, 43% of total) could be further reduced by moving to cuFFT on GPU.
 
+### Step 7: cuFFT Batched FFT
+
+Replaced the hand-rolled radix-2 Cooley-Tukey FFT with cuFFT's batched R2C transform. No custom CUDA kernels needed — cuFFT is a host-side library callable from regular C++ (just link `-lcufft`).
+
+The flow: CPU pre-emphasis and windowing → upload windowed frames to GPU → `cufftPlanMany` + `cufftExecR2C` → download complex output → CPU power spectrum, sparse mel, log, normalize.
+
+Long-audio mel time: 42.9ms → 28.4ms (1.5x faster). Total RTFx: 918x → **1054x**.
+
+### Step 8: Investigating the earnings22 WER Gap
+
+The C++ gets 19.05% WER on earnings22 vs Python's 16.19%. Investigated systematically:
+
+1. **Frame count mismatch?** No — `num_samples // HOP` matches ORT's `features_lens` for all files.
+2. **Mel feature differences?** No — CPU mel matches ORT to within 0.001 max diff on earnings22 files.
+3. **FP16 encoder precision?** No — FP32 TRT encoder gives the same 19.20% WER.
+4. **Decode loop bug?** No — onnx-asr's TDT decode loop (asr.py:181-203) is functionally identical to ours.
+5. **Root cause: TRT graph optimization.** Even FP32 TRT encoder output differs from ORT CUDA EP by max 0.019. This is from different layer fusion and kernel implementations, not precision. On noisy earnings22 data, these small differences cascade through the decoder.
+
+**Conclusion:** The 3% earnings22 WER gap is an inherent artifact of TRT vs ORT graph compilation. It affects noisy data where the model is near decision boundaries. On clean speech (librispeech), WER matches exactly.
+
+### Final Results
+
+```
+C++ (parakeet.cpp):
+  librispeech: WER=1.81% (matches Python exactly)
+  earnings22:  WER=19.05% (vs Python 16.19% — TRT graph optimization artifact)
+  long-audio:  RTFx=1054x (92s audio, 86.8ms: mel=28.4 enc=30.6 dec=26.3)
+
+Python (parakeet_trt.py via onnx-asr):
+  librispeech: WER=1.81%
+  earnings22:  WER=16.19%
+  long-audio:  RTFx=848x (92s audio, 108ms)
+```
+
+The C++ binary is **24% faster** than the Python baseline while matching accuracy on clean speech.
+
 ### Architecture
 
 ```

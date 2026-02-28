@@ -1,7 +1,8 @@
 // parakeet.cpp — Clean TensorRT C++ runtime for Parakeet TDT 0.6B V2
 //
-// Single-file inference: reads a WAV file, computes mel spectrogram on CPU,
-// runs encoder and decoder TRT engines on GPU, prints transcription.
+// Single-file inference: reads a WAV file, computes mel spectrogram
+// (cuFFT for batched FFT, CPU for the rest), runs encoder and decoder
+// TRT engines on GPU, prints transcription.
 //
 // Build: make parakeet
 // Usage: ./parakeet audio.wav
@@ -19,6 +20,7 @@
 #include <vector>
 
 #include <cuda_runtime.h>
+#include <cufft.h>
 #include "NvInfer.h"
 
 // ---------------------------------------------------------------------------
@@ -186,13 +188,17 @@ static std::vector<float> load_binary_f32(const std::string& path, size_t expect
 
 struct MelSpec {
     std::vector<float> hann;          // [N_FFT]
-    // Precomputed twiddle factors for radix-2 FFT
-    std::vector<float> cos_table, sin_table;
     // Sparse mel filterbank: for each freq bin k, list of (mel_bin, weight) pairs
     struct MelEntry { int mel_bin; float weight; };
     std::vector<std::vector<MelEntry>> sparse_fb;  // [N_FREQ]
-    // Precomputed bit-reversal permutation for FFT
-    int bitrev[N_FFT];
+
+    // cuFFT plan (cached for a given batch size)
+    cufftHandle fft_plan = 0;
+    int fft_plan_batch = 0;
+    // GPU buffers for cuFFT (reused across calls, grow-only)
+    float* d_frames = nullptr;            // [n_frames, N_FFT] real input
+    cufftComplex* d_fft_out = nullptr;    // [n_frames, N_FREQ] complex output
+    size_t frames_cap = 0, fft_cap = 0;
 
     void init(const std::string& model_dir) {
         hann = load_binary_f32(model_dir + "/hann_window.bin", N_FFT);
@@ -203,88 +209,90 @@ struct MelSpec {
             for (int m = 0; m < N_MELS; m++)
                 if (mel_fb[k * N_MELS + m] != 0.0f)
                     sparse_fb[k].push_back({m, mel_fb[k * N_MELS + m]});
-        // Twiddle factors for N_FFT-point FFT
-        cos_table.resize(N_FFT / 2);
-        sin_table.resize(N_FFT / 2);
-        for (int i = 0; i < N_FFT / 2; i++) {
-            double angle = -2.0 * M_PI * i / N_FFT;
-            cos_table[i] = (float)cos(angle);
-            sin_table[i] = (float)sin(angle);
+    }
+
+    ~MelSpec() {
+        if (fft_plan) cufftDestroy(fft_plan);
+        if (d_frames) cudaFree(d_frames);
+        if (d_fft_out) cudaFree(d_fft_out);
+    }
+
+    // Ensure cuFFT plan and GPU buffers are large enough for n_frames
+    void ensure_fft(int n_frames) {
+        size_t need_frames = (size_t)n_frames * N_FFT * sizeof(float);
+        if (need_frames > frames_cap) {
+            if (d_frames) cudaFree(d_frames);
+            CUDA_CHECK(cudaMalloc(&d_frames, need_frames));
+            frames_cap = need_frames;
         }
-        // Bit-reversal permutation table
-        for (int i = 0; i < N_FFT; i++) bitrev[i] = i;
-        for (int i = 1, j = 0; i < N_FFT; i++) {
-            int bit = N_FFT >> 1;
-            for (; j & bit; bit >>= 1) j ^= bit;
-            j ^= bit;
-            bitrev[i] = j;
+        size_t need_fft = (size_t)n_frames * N_FREQ * sizeof(cufftComplex);
+        if (need_fft > fft_cap) {
+            if (d_fft_out) cudaFree(d_fft_out);
+            CUDA_CHECK(cudaMalloc(&d_fft_out, need_fft));
+            fft_cap = need_fft;
+        }
+        if (n_frames != fft_plan_batch) {
+            if (fft_plan) cufftDestroy(fft_plan);
+            int n[] = {N_FFT};
+            cufftResult rc = cufftPlanMany(&fft_plan, 1, n,
+                n, 1, N_FFT,    // inembed, istride, idist
+                n, 1, N_FREQ,   // onembed, ostride, odist
+                CUFFT_R2C, n_frames);
+            if (rc != CUFFT_SUCCESS) {
+                fprintf(stderr, "cuFFT plan failed: %d\n", rc); std::exit(1);
+            }
+            fft_plan_batch = n_frames;
         }
     }
 
-    // In-place radix-2 Cooley-Tukey FFT. Input: real[N_FFT], imag[N_FFT]
-    void fft(float* re, float* im) const {
-        // Bit-reversal permutation using precomputed table
-        for (int i = 0; i < N_FFT; i++) {
-            if (i < bitrev[i]) {
-                std::swap(re[i], re[bitrev[i]]);
-                std::swap(im[i], im[bitrev[i]]);
-            }
-        }
-        // Butterfly
-        for (int len = 2; len <= N_FFT; len <<= 1) {
-            int half = len / 2;
-            int step = N_FFT / len;
-            for (int i = 0; i < N_FFT; i += len) {
-                for (int j = 0; j < half; j++) {
-                    int idx = j * step;
-                    float tr = cos_table[idx] * re[i+j+half] - sin_table[idx] * im[i+j+half];
-                    float ti = cos_table[idx] * im[i+j+half] + sin_table[idx] * re[i+j+half];
-                    re[i+j+half] = re[i+j] - tr;
-                    im[i+j+half] = im[i+j] - ti;
-                    re[i+j] += tr;
-                    im[i+j] += ti;
-                }
-            }
-        }
-    }
-
-    // Compute mel spectrogram features. Output: [N_MELS, n_frames] (channel-first)
-    // n_valid_frames is the number of valid frames (= num_samples / HOP)
+    // Compute mel spectrogram features. Output: [N_MELS, n_valid] (channel-first)
     void compute(const float* audio, int num_samples,
-                 std::vector<float>& features, int& n_frames, int& n_valid) const {
-        // 1. Pre-emphasis: x[0], x[1]-0.97*x[0], x[2]-0.97*x[1], ...
+                 std::vector<float>& features, int& n_frames, int& n_valid) {
+        // 1. Pre-emphasis
         std::vector<float> preemph(num_samples);
         preemph[0] = audio[0];
         for (int i = 1; i < num_samples; i++)
             preemph[i] = audio[i] - PREEMPH * audio[i - 1];
 
-        // 2. Zero out beyond valid samples (no-op for single utterance)
-        // 3. Pad: N_FFT/2 = 256 zeros on each side
+        // 2. Frame count
         int pad = N_FFT / 2;
         int padded_len = num_samples + 2 * pad;
-        std::vector<float> padded(padded_len, 0.0f);
-        memcpy(padded.data() + pad, preemph.data(), num_samples * sizeof(float));
-
-        // 4. STFT
         n_frames = (padded_len - N_FFT) / HOP + 1;
         n_valid = num_samples / HOP;
 
-        // Power spectrum: [n_frames, N_FREQ]
-        std::vector<float> power(n_frames * N_FREQ);
-        float re[N_FFT], im[N_FFT];
-
-        for (int frame = 0; frame < n_frames; frame++) {
-            int offset = frame * HOP;
+        // 3. Extract windowed frames into contiguous buffer (CPU)
+        //    frames[f][i] = padded[f*HOP + i] * hann[i], with zero-padding
+        std::vector<float> frames(n_frames * N_FFT, 0.0f);
+        for (int f = 0; f < n_frames; f++) {
+            float* row = frames.data() + f * N_FFT;
             for (int i = 0; i < N_FFT; i++) {
-                re[i] = padded[offset + i] * hann[i];
-                im[i] = 0.0f;
+                int pos = f * HOP + i - pad;
+                float sample = (pos >= 0 && pos < num_samples) ? preemph[pos] : 0.0f;
+                row[i] = sample * hann[i];
             }
-            fft(re, im);
-            for (int k = 0; k < N_FREQ; k++)
-                power[frame * N_FREQ + k] = re[k] * re[k] + im[k] * im[k];
         }
 
-        // 5. Mel filterbank (sparse): power [n_frames, 257] → mel [n_frames, 128]
+        // 4. Batched R2C FFT on GPU via cuFFT
+        ensure_fft(n_frames);
+        CUDA_CHECK(cudaMemcpy(d_frames, frames.data(),
+                               n_frames * N_FFT * sizeof(float),
+                               cudaMemcpyHostToDevice));
+        cufftResult rc = cufftExecR2C(fft_plan, d_frames, d_fft_out);
+        if (rc != CUFFT_SUCCESS) {
+            fprintf(stderr, "cuFFT exec failed: %d\n", rc); std::exit(1);
+        }
+        // Download complex output
+        std::vector<cufftComplex> fft_out(n_frames * N_FREQ);
+        CUDA_CHECK(cudaMemcpy(fft_out.data(), d_fft_out,
+                               n_frames * N_FREQ * sizeof(cufftComplex),
+                               cudaMemcpyDeviceToHost));
+
+        // 5. Power spectrum (CPU)
+        std::vector<float> power(n_frames * N_FREQ);
+        for (int i = 0; i < n_frames * N_FREQ; i++)
+            power[i] = fft_out[i].x * fft_out[i].x + fft_out[i].y * fft_out[i].y;
+
+        // 6. Sparse mel filterbank: power [n_frames, 257] → mel [n_frames, 128]
         std::vector<float> mel(n_frames * N_MELS, 0.0f);
         for (int f = 0; f < n_frames; f++) {
             float* mel_row = mel.data() + f * N_MELS;
@@ -296,20 +304,17 @@ struct MelSpec {
             }
         }
 
-        // 6. Log
+        // 7. Log
         for (auto& v : mel) v = logf(v + LOG_EPS);
 
-        // 7. Transpose to [128, n_valid] and normalize per channel
-        //    Only output valid frames — the encoder expects exactly n_valid frames.
+        // 8. Transpose to [128, n_valid] and normalize per channel
         features.resize(N_MELS * n_valid);
         for (int m = 0; m < N_MELS; m++) {
-            // Compute mean over valid frames
             double sum = 0;
             for (int f = 0; f < n_valid; f++)
                 sum += mel[f * N_MELS + m];
             float mean = (float)(sum / n_valid);
 
-            // Compute std (unbiased, N-1)
             double sq_sum = 0;
             for (int f = 0; f < n_valid; f++) {
                 float d = mel[f * N_MELS + m] - mean;
@@ -317,10 +322,8 @@ struct MelSpec {
             }
             float std_val = sqrtf((float)(sq_sum / (n_valid - 1))) + NORM_EPS;
 
-            // Normalize and transpose
-            for (int f = 0; f < n_valid; f++) {
+            for (int f = 0; f < n_valid; f++)
                 features[m * n_valid + f] = (mel[f * N_MELS + m] - mean) / std_val;
-            }
         }
     }
 };
