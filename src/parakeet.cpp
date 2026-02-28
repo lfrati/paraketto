@@ -7,7 +7,6 @@
 // Build: make parakeet
 // Usage: ./parakeet audio.wav
 
-#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -158,6 +157,7 @@ static WavData read_wav(const std::string& path) {
     }
 
     if (num_channels != 1) { fprintf(stderr, "Need mono, got %d ch\n", num_channels); std::exit(1); }
+    if (sample_rate != 16000) { fprintf(stderr, "Need 16kHz, got %dHz: %s\n(resample with: ffmpeg -i input.wav -ar 16000 output.wav)\n", sample_rate, path.c_str()); std::exit(1); }
 
     WavData wav;
     wav.sample_rate = sample_rate;
@@ -392,7 +392,6 @@ struct Pipeline {
     MelSpec mel;
     Vocab vocab;
     cudaStream_t stream = nullptr;
-
     // GPU buffers
     GpuBuf d_features, d_length, d_enc_out, d_enc_lens;
     GpuBuf d_enc_frame;       // [1, 1024, 1]
@@ -556,33 +555,51 @@ private:
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <wav_file> [engine_dir] [model_dir]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--engine-dir DIR] [--model-dir DIR] <wav_file>...\n", argv[0]);
         return 1;
     }
 
-    std::string engine_dir = argc > 2 ? argv[2] : "engines";
-    std::string model_dir  = argc > 3 ? argv[3] : "model";
+    std::string engine_dir = "engines";
+    std::string model_dir = "model";
+    std::vector<std::string> wav_files;
 
-    auto wav = read_wav(argv[1]);
-    double audio_dur = (double)wav.samples.size() / wav.sample_rate;
+    for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]) == "--engine-dir" && i + 1 < argc)
+            engine_dir = argv[++i];
+        else if (std::string(argv[i]) == "--model-dir" && i + 1 < argc)
+            model_dir = argv[++i];
+        else
+            wav_files.push_back(argv[i]);
+    }
+
+    if (wav_files.empty()) {
+        fprintf(stderr, "No WAV files specified.\n");
+        return 1;
+    }
 
     Pipeline pipeline;
     pipeline.init(engine_dir, model_dir);
 
-    // Warmup
-    pipeline.transcribe(wav.samples.data(), wav.samples.size());
+    // Warmup with first file
+    auto warmup_wav = read_wav(wav_files[0]);
+    pipeline.transcribe(warmup_wav.samples.data(), warmup_wav.samples.size());
 
-    // Timed run
-    auto t0 = std::chrono::high_resolution_clock::now();
-    std::string text = pipeline.transcribe(wav.samples.data(), wav.samples.size());
-    auto t1 = std::chrono::high_resolution_clock::now();
+    // Process each file
+    for (auto& path : wav_files) {
+        auto wav = read_wav(path);
+        double audio_dur = (double)wav.samples.size() / wav.sample_rate;
 
-    double elapsed = std::chrono::duration<double>(t1 - t0).count();
-    printf("%s\n", text.c_str());
-    fprintf(stderr, "%.1fs audio, %.1fms inference (mel=%.1f enc=%.1f dec=%.1f), %.0fx RTFx\n",
-            audio_dur, elapsed * 1000,
-            pipeline.last_mel_ms, pipeline.last_enc_ms, pipeline.last_dec_ms,
-            audio_dur / elapsed);
+        auto t0 = std::chrono::high_resolution_clock::now();
+        std::string text = pipeline.transcribe(wav.samples.data(), wav.samples.size());
+        auto t1 = std::chrono::high_resolution_clock::now();
+
+        double elapsed = std::chrono::duration<double>(t1 - t0).count();
+        printf("%s\n", text.c_str());
+        fprintf(stderr, "%.1fs audio, %.1fms (mel=%.1f enc=%.1f dec=%.1f), %.0fx RTFx\n",
+                audio_dur, elapsed * 1000,
+                pipeline.last_mel_ms, pipeline.last_enc_ms, pipeline.last_dec_ms,
+                audio_dur / elapsed);
+    }
 
     return 0;
 }
