@@ -46,6 +46,11 @@ struct Weights {
     void* gpu_data = nullptr;        // single contiguous GPU allocation
     size_t gpu_data_size = 0;
 
+    // Prefetch state (temporary — cleared after upload)
+    void* mmap_ptr = nullptr;
+    size_t mmap_size = 0;
+    size_t data_offset = 0;          // offset to data section within mmap
+
     // Parsed index (kept for diagnostics)
     std::vector<TensorDesc> tensors;
     std::unordered_map<std::string, size_t> name_to_idx;
@@ -151,6 +156,13 @@ struct Weights {
 
     /// Load weights from a .bin file produced by export_weights.py.
     static Weights load(const std::string& path, cudaStream_t stream = nullptr);
+
+    /// Phase 1: mmap + parse header + populate pages (CPU only, no CUDA needed).
+    /// Call upload() after CUDA context is ready.
+    static Weights prefetch(const std::string& path);
+
+    /// Phase 2: cudaMalloc + cudaMemcpy from prefetched mmap, then assign pointers.
+    void upload(cudaStream_t stream = nullptr);
 
     /// Free the GPU allocation.
     void free();

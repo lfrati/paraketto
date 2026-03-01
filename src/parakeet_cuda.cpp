@@ -16,6 +16,7 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <mutex>
@@ -686,24 +687,16 @@ struct Pipeline {
     MelSpec mel;
     cudaStream_t stream = nullptr;
 
-    void init(const std::string& weights_path) {
-        using clk = std::chrono::high_resolution_clock;
-        auto t0 = clk::now();
-
+    // Initialize with already-prefetched weights (upload to GPU + build model).
+    void init(Weights&& prefetched) {
         CUDA_CHECK(cudaStreamCreate(&stream));
-        weights = Weights::load(weights_path, stream);
-        auto t_weights = clk::now();
+        weights = std::move(prefetched);
+        weights.upload(stream);
 
         mel.init();
-        mel.ensure_fft(1000);  // Pre-create cuFFT plan for ~10s audio
-        auto t_mel = clk::now();
+        mel.ensure_fft(1000);
 
         cuda_model.init(weights, stream, 16000 * 120 / 160);  // 120s max audio
-        auto t_model = clk::now();
-
-        auto ms = [](auto a, auto b) { return std::chrono::duration<double,std::milli>(b-a).count(); };
-        fprintf(stderr, "init: %.0fms (weights=%.0f mel=%.0f model=%.0f)\n",
-                ms(t0,t_model), ms(t0,t_weights), ms(t_weights,t_mel), ms(t_mel,t_model));
     }
 
     ~Pipeline() {
@@ -935,7 +928,13 @@ int main(int argc, char** argv) {
     using clk = std::chrono::high_resolution_clock;
     auto t_main_start = clk::now();
 
-    // Force CUDA driver/context initialization
+    // Prefetch weights (mmap + populate pages) in background while CUDA inits
+    Weights prefetched;
+    std::thread prefetch_thread([&]() {
+        prefetched = Weights::prefetch(weights_path);
+    });
+
+    // Force CUDA driver/context initialization (overlaps with prefetch)
     cudaFree(0);
     auto t_cuda_init = clk::now();
 
@@ -944,8 +943,11 @@ int main(int argc, char** argv) {
         if (wav_fd >= 0) { posix_fadvise(wav_fd, 0, 0, POSIX_FADV_WILLNEED); close(wav_fd); }
     }
 
+    prefetch_thread.join();
+    auto t_prefetch = clk::now();
+
     Pipeline pipeline;
-    pipeline.init(weights_path);
+    pipeline.init(std::move(prefetched));
     auto t_init_done = clk::now();
 
     if (server_mode) {
@@ -973,9 +975,10 @@ int main(int argc, char** argv) {
         fprintf(stderr, "device:    %s (compute %d.%d, %.0f MB VRAM, %.0f MB free)\n",
                 prop.name, prop.major, prop.minor,
                 vram_total / (1024.0 * 1024.0), vram_free / (1024.0 * 1024.0));
-        fprintf(stderr, "startup:   %.0f ms (cuda_init=%.0f weights+model=%.0f warmup=%.0f)\n",
+        fprintf(stderr, "startup:   %.0f ms (cuda=%.0f prefetch=%.0f load=%.0f warmup=%.0f)\n",
                 ms(t_main_start, t_warmup_done), ms(t_main_start, t_cuda_init),
-                ms(t_cuda_init, t_init_done), ms(t_init_done, t_warmup_done));
+                ms(t_main_start, t_prefetch),
+                ms(t_prefetch, t_init_done), ms(t_init_done, t_warmup_done));
         fprintf(stderr, "endpoints: GET /health | POST /transcribe\n");
         fprintf(stderr, "\n");
 
@@ -985,15 +988,15 @@ int main(int argc, char** argv) {
 
     // CLI mode: warmup with first file
     auto warmup_wav = read_wav(wav_files[0]);
-    auto t_wav_read = clk::now();
     pipeline.transcribe(warmup_wav.samples.data(), warmup_wav.samples.size());
     auto t_warmup_done = clk::now();
 
     auto ms = [](auto a, auto b) { return std::chrono::duration<double,std::milli>(b-a).count(); };
-    fprintf(stderr, "startup: %.0fms total (cuda_init=%.0f init=%.0f wav_read=%.0f warmup=%.0f)\n",
+    fprintf(stderr, "startup: %.0fms (cuda=%.0f prefetch=%.0f load=%.0f warmup=%.0f)\n",
             ms(t_main_start, t_warmup_done), ms(t_main_start, t_cuda_init),
-            ms(t_cuda_init, t_init_done),
-            ms(t_init_done, t_wav_read), ms(t_wav_read, t_warmup_done));
+            ms(t_main_start, t_prefetch),
+            ms(t_prefetch, t_init_done),
+            ms(t_init_done, t_warmup_done));
 
     // Process each file
     for (size_t fi = 0; fi < wav_files.size(); fi++) {

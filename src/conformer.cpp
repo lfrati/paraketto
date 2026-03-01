@@ -67,13 +67,88 @@ static std::vector<TensorDesc> parse_header(const char* header_text, size_t head
 }
 
 // ---------------------------------------------------------------------------
-// Weights::load
+// Weights: pointer assignment (shared by load and upload)
 // ---------------------------------------------------------------------------
 
-Weights Weights::load(const std::string& path, cudaStream_t stream) {
+static void assign_weight_pointers(Weights& w) {
+    uint8_t* gpu_base = (uint8_t*)w.gpu_data;
+
+    auto lookup = [&](const std::string& name) -> half* {
+        auto it = w.name_to_idx.find(name);
+        if (it == w.name_to_idx.end()) return nullptr;
+        return (half*)(gpu_base + w.tensors[it->second].offset);
+    };
+
+    // Subsampling (pre_encode)
+    for (int i : {0, 2, 3, 5, 6}) {
+        std::string pre = "encoder/pre_encode.conv." + std::to_string(i);
+        w.sub_conv[i].weight = lookup(pre + ".weight");
+        w.sub_conv[i].bias   = lookup(pre + ".bias");
+    }
+    w.sub_out_w = lookup("encoder/pre_encode.out.weight");
+    w.sub_out_b = lookup("encoder/pre_encode.out.bias");
+
+    // Conformer blocks (x24)
+    for (int i = 0; i < 24; i++) {
+        auto& blk = w.blocks[i];
+        std::string pre = "encoder/layers." + std::to_string(i);
+
+        blk.ff1_ln_w = lookup(pre + ".norm_feed_forward1.weight");
+        blk.ff1_ln_b = lookup(pre + ".norm_feed_forward1.bias");
+        blk.ff1_w1   = lookup(pre + ".feed_forward1.linear1.weight");
+        blk.ff1_w2   = lookup(pre + ".feed_forward1.linear2.weight");
+
+        blk.mhsa_ln_w = lookup(pre + ".norm_self_att.weight");
+        blk.mhsa_ln_b = lookup(pre + ".norm_self_att.bias");
+        blk.q_w       = lookup(pre + ".self_attn.linear_q.weight");
+        blk.k_w       = lookup(pre + ".self_attn.linear_k.weight");
+        blk.v_w       = lookup(pre + ".self_attn.linear_v.weight");
+        blk.pos_w     = lookup(pre + ".self_attn.linear_pos.weight");
+        blk.pos_bias_u = lookup(pre + ".self_attn.pos_bias_u");
+        blk.pos_bias_v = lookup(pre + ".self_attn.pos_bias_v");
+        blk.out_w     = lookup(pre + ".self_attn.linear_out.weight");
+
+        blk.conv_ln_w  = lookup(pre + ".norm_conv.weight");
+        blk.conv_ln_b  = lookup(pre + ".norm_conv.bias");
+        blk.conv_pw1_w = lookup(pre + ".conv.pointwise_conv1.weight");
+        blk.conv_dw_w  = lookup(pre + ".conv.depthwise_conv.weight");
+        blk.conv_dw_b  = lookup(pre + ".conv.depthwise_conv.bias");
+        blk.conv_pw2_w = lookup(pre + ".conv.pointwise_conv2.weight");
+
+        blk.ff2_ln_w = lookup(pre + ".norm_feed_forward2.weight");
+        blk.ff2_ln_b = lookup(pre + ".norm_feed_forward2.bias");
+        blk.ff2_w1   = lookup(pre + ".feed_forward2.linear1.weight");
+        blk.ff2_w2   = lookup(pre + ".feed_forward2.linear2.weight");
+
+        blk.final_ln_w = lookup(pre + ".norm_out.weight");
+        blk.final_ln_b = lookup(pre + ".norm_out.bias");
+    }
+
+    // Decoder: embedding + LSTM
+    w.embed_w = lookup("decoder/decoder.prediction.embed.weight");
+    w.lstm0_w_ih = lookup("decoder/decoder.dec_rnn.lstm.weight_ih");
+    w.lstm0_w_hh = lookup("decoder/decoder.dec_rnn.lstm.weight_hh");
+    w.lstm0_bias = lookup("decoder/decoder.dec_rnn.lstm.bias");
+    w.lstm1_w_ih = lookup("decoder/decoder.dec_rnn.lstm.1.weight_ih");
+    w.lstm1_w_hh = lookup("decoder/decoder.dec_rnn.lstm.1.weight_hh");
+    w.lstm1_bias = lookup("decoder/decoder.dec_rnn.lstm.1.bias");
+
+    // Joint network
+    w.enc_proj_w = lookup("decoder/joint.enc.weight");
+    w.enc_proj_b = lookup("decoder/joint.enc.bias");
+    w.dec_proj_w = lookup("decoder/joint.pred.weight");
+    w.dec_proj_b = lookup("decoder/joint.pred.bias");
+    w.out_proj_w = lookup("decoder/joint.joint_net.joint_net.2.weight");
+    w.out_proj_b = lookup("decoder/joint.joint_net.2.bias");
+}
+
+// ---------------------------------------------------------------------------
+// Weights::prefetch — CPU only, no CUDA. mmap + populate pages + parse header.
+// ---------------------------------------------------------------------------
+
+Weights Weights::prefetch(const std::string& path) {
     Weights w;
 
-    // mmap the file
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) {
         fprintf(stderr, "Cannot open weights: %s\n", path.c_str());
@@ -83,9 +158,9 @@ Weights Weights::load(const std::string& path, cudaStream_t stream) {
     fstat(fd, &st);
     size_t file_size = st.st_size;
     void* mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0);
+    close(fd);
     if (mapped == MAP_FAILED) {
         fprintf(stderr, "mmap failed: %s\n", path.c_str());
-        close(fd);
         std::exit(1);
     }
     madvise(mapped, file_size, MADV_SEQUENTIAL);
@@ -97,7 +172,6 @@ Weights Weights::load(const std::string& path, cudaStream_t stream) {
     if (magic != PRKT_MAGIC) {
         fprintf(stderr, "Bad magic in %s: expected PRKT\n", path.c_str());
         munmap(mapped, file_size);
-        close(fd);
         std::exit(1);
     }
 
@@ -106,27 +180,19 @@ Weights Weights::load(const std::string& path, cudaStream_t stream) {
     if (version != PRKT_VERSION) {
         fprintf(stderr, "Unsupported weight file version %u (expected %u)\n", version, PRKT_VERSION);
         munmap(mapped, file_size);
-        close(fd);
         std::exit(1);
     }
 
     uint64_t header_len;
     memcpy(&header_len, base + 8, 8);
+    w.tensors = parse_header((const char*)(base + 16), header_len);
 
-    // Parse text index
-    const char* header_text = (const char*)(base + 16);
-    w.tensors = parse_header(header_text, header_len);
-
-    // Build name lookup
-    for (size_t i = 0; i < w.tensors.size(); i++) {
+    for (size_t i = 0; i < w.tensors.size(); i++)
         w.name_to_idx[w.tensors[i].name] = i;
-    }
 
-    // Compute data section start
     size_t header_end = 16 + header_len;
     size_t data_start = align_up(header_end, HEADER_ALIGN);
 
-    // Compute total GPU allocation needed
     size_t total_data = 0;
     for (auto& td : w.tensors) {
         size_t end = td.offset + td.size_bytes;
@@ -138,111 +204,45 @@ Weights Weights::load(const std::string& path, cudaStream_t stream) {
     }
 
     w.gpu_data_size = total_data;
+    w.mmap_ptr = mapped;
+    w.mmap_size = file_size;
+    w.data_offset = data_start;
 
-    // Allocate GPU memory and copy data in one shot
-    CUDA_CHECK(cudaMalloc(&w.gpu_data, total_data));
+    return w;
+}
+
+// ---------------------------------------------------------------------------
+// Weights::upload — cudaMalloc + cudaMemcpy from prefetched mmap, assign ptrs.
+// ---------------------------------------------------------------------------
+
+void Weights::upload(cudaStream_t stream) {
+    const uint8_t* base = (const uint8_t*)mmap_ptr;
+
+    CUDA_CHECK(cudaMalloc(&gpu_data, gpu_data_size));
     if (stream) {
-        CUDA_CHECK(cudaMemcpyAsync(w.gpu_data, base + data_start, total_data,
+        CUDA_CHECK(cudaMemcpyAsync(gpu_data, base + data_offset, gpu_data_size,
                                     cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
     } else {
-        CUDA_CHECK(cudaMemcpy(w.gpu_data, base + data_start, total_data,
+        CUDA_CHECK(cudaMemcpy(gpu_data, base + data_offset, gpu_data_size,
                                cudaMemcpyHostToDevice));
     }
 
-    // Clean up mmap
-    munmap(mapped, file_size);
-    close(fd);
+    munmap(mmap_ptr, mmap_size);
+    mmap_ptr = nullptr;
+    mmap_size = 0;
+    data_offset = 0;
 
-    // Assign struct field pointers by matching tensor names.
-    uint8_t* gpu_base = (uint8_t*)w.gpu_data;
+    assign_weight_pointers(*this);
+}
 
-    auto lookup = [&](const std::string& name) -> half* {
-        auto it = w.name_to_idx.find(name);
-        if (it == w.name_to_idx.end()) return nullptr;
-        return (half*)(gpu_base + w.tensors[it->second].offset);
-    };
+// ---------------------------------------------------------------------------
+// Weights::load — convenience: prefetch + upload in one call.
+// ---------------------------------------------------------------------------
 
-    // ---------------------------------------------------------------------------
-    // Subsampling (pre_encode)
-    // Conv layers: 0, 2, 3, 5, 6
-    // ---------------------------------------------------------------------------
-    for (int i : {0, 2, 3, 5, 6}) {
-        std::string pre = "encoder/pre_encode.conv." + std::to_string(i);
-        w.sub_conv[i].weight = lookup(pre + ".weight");
-        w.sub_conv[i].bias   = lookup(pre + ".bias");
-    }
-    w.sub_out_w = lookup("encoder/pre_encode.out.weight");
-    w.sub_out_b = lookup("encoder/pre_encode.out.bias");
-
-    // ---------------------------------------------------------------------------
-    // Conformer blocks (x24)
-    // ---------------------------------------------------------------------------
-    for (int i = 0; i < 24; i++) {
-        auto& blk = w.blocks[i];
-        std::string pre = "encoder/layers." + std::to_string(i);
-
-        // FF1
-        blk.ff1_ln_w = lookup(pre + ".norm_feed_forward1.weight");
-        blk.ff1_ln_b = lookup(pre + ".norm_feed_forward1.bias");
-        blk.ff1_w1   = lookup(pre + ".feed_forward1.linear1.weight");
-        blk.ff1_w2   = lookup(pre + ".feed_forward1.linear2.weight");
-
-        // MHSA
-        blk.mhsa_ln_w = lookup(pre + ".norm_self_att.weight");
-        blk.mhsa_ln_b = lookup(pre + ".norm_self_att.bias");
-        blk.q_w       = lookup(pre + ".self_attn.linear_q.weight");
-        blk.k_w       = lookup(pre + ".self_attn.linear_k.weight");
-        blk.v_w       = lookup(pre + ".self_attn.linear_v.weight");
-        blk.pos_w     = lookup(pre + ".self_attn.linear_pos.weight");
-        blk.pos_bias_u = lookup(pre + ".self_attn.pos_bias_u");
-        blk.pos_bias_v = lookup(pre + ".self_attn.pos_bias_v");
-        blk.out_w     = lookup(pre + ".self_attn.linear_out.weight");
-
-        // Conv module
-        blk.conv_ln_w  = lookup(pre + ".norm_conv.weight");
-        blk.conv_ln_b  = lookup(pre + ".norm_conv.bias");
-        blk.conv_pw1_w = lookup(pre + ".conv.pointwise_conv1.weight");
-        blk.conv_dw_w  = lookup(pre + ".conv.depthwise_conv.weight");
-        blk.conv_dw_b  = lookup(pre + ".conv.depthwise_conv.bias");
-        blk.conv_pw2_w = lookup(pre + ".conv.pointwise_conv2.weight");
-
-        // FF2
-        blk.ff2_ln_w = lookup(pre + ".norm_feed_forward2.weight");
-        blk.ff2_ln_b = lookup(pre + ".norm_feed_forward2.bias");
-        blk.ff2_w1   = lookup(pre + ".feed_forward2.linear1.weight");
-        blk.ff2_w2   = lookup(pre + ".feed_forward2.linear2.weight");
-
-        // Final LN
-        blk.final_ln_w = lookup(pre + ".norm_out.weight");
-        blk.final_ln_b = lookup(pre + ".norm_out.bias");
-    }
-
-    // ---------------------------------------------------------------------------
-    // Decoder: embedding + LSTM (ONNX format)
-    // ---------------------------------------------------------------------------
-    w.embed_w = lookup("decoder/decoder.prediction.embed.weight");
-
-    // LSTM layer 0
-    w.lstm0_w_ih = lookup("decoder/decoder.dec_rnn.lstm.weight_ih");
-    w.lstm0_w_hh = lookup("decoder/decoder.dec_rnn.lstm.weight_hh");
-    w.lstm0_bias = lookup("decoder/decoder.dec_rnn.lstm.bias");
-
-    // LSTM layer 1
-    w.lstm1_w_ih = lookup("decoder/decoder.dec_rnn.lstm.1.weight_ih");
-    w.lstm1_w_hh = lookup("decoder/decoder.dec_rnn.lstm.1.weight_hh");
-    w.lstm1_bias = lookup("decoder/decoder.dec_rnn.lstm.1.bias");
-
-    // ---------------------------------------------------------------------------
-    // Joint network
-    // ---------------------------------------------------------------------------
-    w.enc_proj_w = lookup("decoder/joint.enc.weight");
-    w.enc_proj_b = lookup("decoder/joint.enc.bias");
-    w.dec_proj_w = lookup("decoder/joint.pred.weight");
-    w.dec_proj_b = lookup("decoder/joint.pred.bias");
-    w.out_proj_w = lookup("decoder/joint.joint_net.joint_net.2.weight");
-    w.out_proj_b = lookup("decoder/joint.joint_net.2.bias");
-
+Weights Weights::load(const std::string& path, cudaStream_t stream) {
+    Weights w = prefetch(path);
+    w.upload(stream);
     return w;
 }
 
