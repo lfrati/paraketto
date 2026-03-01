@@ -1,8 +1,8 @@
 """Benchmark the C++ parakeet binary: WER and RTFx.
 
 Starts the parakeet HTTP server, sends all utterances from
-data/{librispeech,earnings22}/manifest.json via /transcribe,
-reports per-dataset WER and RTFx, plus long-audio RTFx.
+data/{librispeech,earnings22,long}/manifest.json via /transcribe,
+reports per-dataset WER and RTFx.
 
 Usage:
     uv run python tests/bench_cpp.py
@@ -25,8 +25,7 @@ SERVER_URL = "http://localhost:18080"
 
 _normalize = Compose([ToLowerCase(), RemovePunctuation(), ReduceToListOfListOfWords()])
 
-DATASETS = ["librispeech", "earnings22"]
-LONG_AUDIO = DATA_DIR / "combined-90s.wav"
+DATASETS = ["librispeech", "earnings22", "long", "difficult"]
 
 
 def load_manifest(name: str) -> list[dict]:
@@ -105,11 +104,6 @@ def main():
 
         print(f"total: {total_audio:.0f}s audio in {total_inference*1000:.0f}ms, {total_audio/total_inference:.0f}x RTFx")
 
-        # Long-audio
-        result = transcribe(str(LONG_AUDIO))
-        audio_s = result["audio_duration_s"]
-        inf_s = result["inference_time_s"]
-        print(f"long-audio: {audio_s:.1f}s audio, {inf_s*1000:.1f}ms, {audio_s/inf_s:.0f}x RTFx")
 
     finally:
         server.send_signal(signal.SIGINT)

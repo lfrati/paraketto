@@ -1,8 +1,7 @@
 """Benchmark Parakeet TDT V2 TensorRT: WER and RTFx.
 
-Runs all utterances from data/{librispeech,earnings22}/manifest.json,
-reports per-dataset WER and RTFx, plus a long-audio RTFx measurement
-on data/combined-90s.wav.
+Runs all utterances from data/{librispeech,earnings22,long}/manifest.json,
+reports per-dataset WER and RTFx.
 
 Usage:
     uv run python tests/bench.py
@@ -13,7 +12,6 @@ import sys
 import time
 from pathlib import Path
 
-import soundfile as sf
 from jiwer import Compose, ReduceToListOfListOfWords, RemovePunctuation, ToLowerCase, wer
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -23,8 +21,7 @@ DATA_DIR = ROOT / "data"
 
 _normalize = Compose([ToLowerCase(), RemovePunctuation(), ReduceToListOfListOfWords()])
 
-DATASETS = ["librispeech", "earnings22"]
-LONG_AUDIO = DATA_DIR / "combined-90s.wav"
+DATASETS = ["librispeech", "earnings22", "long", "difficult"]
 
 
 def load_manifest(name: str) -> list[dict]:
@@ -71,24 +68,6 @@ def main():
         print(f"{dataset}: WER={wer_pct:.2f}% RTFx={rtfx:.0f}x "
               f"({len(manifest)} utts, {total_audio:.0f}s audio)")
 
-    # Long-audio RTFx (no ground truth, just speed)
-    audio, sr = sf.read(str(LONG_AUDIO), dtype="float32")
-    audio_dur = len(audio) / sr
-
-    parakeet_trt.transcribe(audio, sr)  # warmup
-
-    runs = 5
-    times = []
-    for _ in range(runs):
-        t0 = time.perf_counter()
-        parakeet_trt.transcribe(audio, sr)
-        elapsed = time.perf_counter() - t0
-        times.append(elapsed)
-
-    mean_t = sum(times) / len(times)
-    rtfx_long = audio_dur / mean_t
-    print(f"long-audio: RTFx={rtfx_long:.0f}x "
-          f"({audio_dur:.0f}s audio, {mean_t*1000:.0f}ms mean, {runs} runs)")
 
 
 if __name__ == "__main__":
