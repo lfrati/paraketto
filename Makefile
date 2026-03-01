@@ -11,7 +11,15 @@ CXXFLAGS = -std=c++17 -O3 -march=native -flto=auto -Wno-deprecated-declarations 
 NVFLAGS  = -std=c++17 -O3 -I$(CUDA_HOME)/include -Isrc --expt-relaxed-constexpr
 LDFLAGS  = -flto=auto -L$(CUDA_HOME)/lib64 -lcudart -lcufft -lcublas -lpthread $(TRT_LIBS)/libnvinfer.so.10 -Wl,-rpath,$(TRT_LIBS)
 
-.PHONY: bench-all bench-py bench-cpp bench-cuda engines inspect-onnx weights clean
+.PHONY: bench-all bench-py bench-cpp bench-cuda engines inspect-onnx weights download-data clean
+
+download-data:
+	@if [ -d data/librispeech ]; then echo "data/ already exists"; else \
+		gh release download bench-data --pattern 'bench-data.tar.gz' && \
+		tar xzf bench-data.tar.gz && \
+		rm bench-data.tar.gz && \
+		echo "Downloaded $$(find data/ -name '*.wav' | wc -l) wav files"; \
+	fi
 
 engines: engines/encoder.engine engines/decoder_joint.engine
 
