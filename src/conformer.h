@@ -206,6 +206,11 @@ struct CudaModel {
     // --- Pre-concatenated QKV weights per block ---
     half* qkv_w[N_BLOCKS];       // [D_MODEL, 3*D_MODEL] per block
 
+    // --- Pre-combined LSTM weights (W_ih||W_hh side by side) ---
+    half* lstm_combined_w[2];    // [4*D_PRED, 2*D_PRED] per layer
+    half* lstm_combined_bias[2]; // [4*D_PRED] per layer (b_ih + b_hh pre-added)
+    half* lstm_input;            // [2*D_PRED] runtime concat buffer
+
     // --- Pooled GPU allocation (single cudaMalloc for all buffers below) ---
     void* gpu_pool = nullptr;
 
@@ -234,14 +239,13 @@ struct CudaModel {
     half* conv_dw    = nullptr;  // [T', D_MODEL]
 
     // --- Decoder buffers (FP16) ---
-    half* dec_embed     = nullptr;  // [D_PRED]
     half* lstm_gates    = nullptr;  // [4*D_PRED]
     half* lstm_h[2];                // h state for 2 LSTM layers, each [D_PRED]
     half* lstm_c[2];                // c state for 2 LSTM layers, each [D_PRED]
     half* lstm_h_out[2];            // output h state (uncommitted)
     half* lstm_c_out[2];            // output c state (uncommitted)
     half* enc_proj_all  = nullptr;  // [T_max, D_JOINT] — precomputed after encoding
-    half* dec_proj      = nullptr;  // [D_JOINT]
+    half* dec_proj_buf  = nullptr;  // [D_JOINT]
     half* joint_act     = nullptr;  // [D_JOINT]
     half* joint_out     = nullptr;  // [D_OUTPUT]
     int*  argmax_out    = nullptr;  // [2] — token, step (for GPU argmax)

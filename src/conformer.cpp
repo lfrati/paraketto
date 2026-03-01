@@ -382,15 +382,20 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
         (size_t)(T_max * D_CONV_PW),            // conv_mid
         (size_t)(T_max * D_MODEL),              // conv_glu
         (size_t)(T_max * D_MODEL),              // conv_dw
-        (size_t)D_PRED,                         // dec_embed
+        (size_t)(2 * D_PRED),                   // lstm_input (concat buffer)
         (size_t)(4 * D_PRED),                   // lstm_gates
         (size_t)D_PRED, (size_t)D_PRED,         // lstm_h[0], lstm_h[1]
         (size_t)D_PRED, (size_t)D_PRED,         // lstm_c[0], lstm_c[1]
         (size_t)D_PRED, (size_t)D_PRED,         // lstm_h_out[0], lstm_h_out[1]
         (size_t)D_PRED, (size_t)D_PRED,         // lstm_c_out[0], lstm_c_out[1]
         (size_t)(T_max * D_JOINT),              // enc_proj_all (precomputed)
-        (size_t)D_JOINT, (size_t)D_JOINT,       // dec_proj, joint_act
+        (size_t)D_JOINT, (size_t)D_JOINT,       // dec_proj_buf, joint_act
         (size_t)D_OUTPUT,                       // joint_out
+        // Pre-combined LSTM weights
+        (size_t)(4 * D_PRED * 2 * D_PRED),     // lstm_combined_w[0]
+        (size_t)(4 * D_PRED * 2 * D_PRED),     // lstm_combined_w[1]
+        (size_t)(4 * D_PRED),                   // lstm_combined_bias[0]
+        (size_t)(4 * D_PRED),                   // lstm_combined_bias[1]
     };
     constexpr int N_BUFS = sizeof(sizes) / sizeof(sizes[0]);
 
@@ -436,14 +441,18 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
     attn_out   = take(sizes[17]);  mhsa_out   = take(sizes[18]);
     conv_mid   = take(sizes[19]);  conv_glu   = take(sizes[20]);
     conv_dw    = take(sizes[21]);
-    dec_embed  = take(sizes[22]);  lstm_gates = take(sizes[23]);
+    lstm_input = take(sizes[22]);  lstm_gates = take(sizes[23]);
     lstm_h[0]  = take(sizes[24]);  lstm_h[1]  = take(sizes[25]);
     lstm_c[0]  = take(sizes[26]);  lstm_c[1]  = take(sizes[27]);
     lstm_h_out[0] = take(sizes[28]); lstm_h_out[1] = take(sizes[29]);
     lstm_c_out[0] = take(sizes[30]); lstm_c_out[1] = take(sizes[31]);
     enc_proj_all = take(sizes[32]);
-    dec_proj   = take(sizes[33]);  joint_act  = take(sizes[34]);
-    joint_out  = take(sizes[35]);
+    dec_proj_buf = take(sizes[33]);  joint_act = take(sizes[34]);
+    joint_out    = take(sizes[35]);
+    lstm_combined_w[0]    = take(sizes[36]);
+    lstm_combined_w[1]    = take(sizes[37]);
+    lstm_combined_bias[0] = take(sizes[38]);
+    lstm_combined_bias[1] = take(sizes[39]);
 
     // QKV weight blocks from pool
     for (int b = 0; b < N_BLOCKS; b++) {
@@ -477,6 +486,32 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
             qkv_w[b] + 2 * D_MODEL, dst_pitch,
             weights.blocks[b].v_w, src_pitch,
             width, D_MODEL, cudaMemcpyDeviceToDevice, stream));
+    }
+
+    // Pre-combine LSTM weights: W_combined[4*D, 2*D] = [W_ih | W_hh] per layer
+    // Same cudaMemcpy2D pattern as QKV concatenation above.
+    {
+        const half* w_ih[2] = { weights.lstm0_w_ih, weights.lstm1_w_ih };
+        const half* w_hh[2] = { weights.lstm0_w_hh, weights.lstm1_w_hh };
+        const half* bias[2] = { weights.lstm0_bias, weights.lstm1_bias };
+        size_t dst_pitch = 2 * D_PRED * sizeof(half);
+        size_t src_pitch = D_PRED * sizeof(half);
+        size_t width = D_PRED * sizeof(half);
+        for (int layer = 0; layer < 2; layer++) {
+            // Left half: W_ih
+            CUDA_CHECK(cudaMemcpy2DAsync(
+                lstm_combined_w[layer], dst_pitch,
+                w_ih[layer], src_pitch,
+                width, 4 * D_PRED, cudaMemcpyDeviceToDevice, stream));
+            // Right half: W_hh
+            CUDA_CHECK(cudaMemcpy2DAsync(
+                lstm_combined_w[layer] + D_PRED, dst_pitch,
+                w_hh[layer], src_pitch,
+                width, 4 * D_PRED, cudaMemcpyDeviceToDevice, stream));
+            // Pre-add biases: combined_bias = b_ih + b_hh
+            residual_add_fp16(bias[layer], bias[layer] + 4 * D_PRED,
+                              lstm_combined_bias[layer], 4 * D_PRED, 1.0f, stream);
+        }
     }
 
     // Pre-compute position encoding for T_max (reused via offset for any T <= T_max)
@@ -752,31 +787,38 @@ int CudaModel::encode_gpu(int T_mel) {
     // sub_buf[0] is now [T_mel, 128] which acts as [C_in=1, H=T_mel, W=128] for conv2d
 
     // 2. Subsampling: [1, T_mel, 128] → [T', 1024]
-    //    conv.0 (1→256, 3x3, s=2) → ReLU
+    //    conv.0 (1→256, 3x3, s=2) → bias+ReLU
+    //    im2col + cuBLAS GEMM replaces naive conv2d (256x input reuse via GEMM)
     int H = T_mel, W = 128;
-    conv2d_fp16(sub_buf[0], w->sub_conv[0].weight, w->sub_conv[0].bias,
-                sub_buf[1], 1, H, W, SUB_CHANNELS, 3, 3, 2, 1, 1, stream);
-    H = (H + 2 * 1 - 3) / 2 + 1;
-    W = (W + 2 * 1 - 3) / 2 + 1;   // 64
-    relu_inplace_fp16(sub_buf[1], SUB_CHANNELS * H * W, stream);
+    int H2 = (H + 2 * 1 - 3) / 2 + 1;
+    int W2 = (W + 2 * 1 - 3) / 2 + 1;  // 64
+    // im2col: [1, H, W] → [9, H2*W2] into ff_mid (free during subsampling)
+    im2col_2d_fp16(sub_buf[0], ff_mid, 1, H, W, 3, 3, 2, 1, H2, W2, stream);
+    // GEMM: output[256, H2*W2] = weight[256, 9] @ im2col[9, H2*W2]
+    gnn(/*X=*/w->sub_conv[0].weight, SUB_CHANNELS, 9,
+        /*W=*/ff_mid, H2 * W2, /*Y=*/sub_buf[1]);
+    bias_relu_nchw_fp16(sub_buf[1], w->sub_conv[0].bias, SUB_CHANNELS, H2 * W2, stream);
+    H = H2; W = W2;
 
-    //    conv.2 (depthwise 256, 3x3, s=2) → conv.3 (pointwise 256→256, 1x1) → ReLU
+    //    conv.2 (depthwise 256, 3x3, s=2) → conv.3 (pointwise 256→256, 1x1) → bias+ReLU
     conv2d_fp16(sub_buf[1], w->sub_conv[2].weight, w->sub_conv[2].bias,
                 sub_buf[0], SUB_CHANNELS, H, W, SUB_CHANNELS, 3, 3, 2, 1, SUB_CHANNELS, stream);
     H = (H + 2 * 1 - 3) / 2 + 1;
     W = (W + 2 * 1 - 3) / 2 + 1;   // 32
-    conv2d_fp16(sub_buf[0], w->sub_conv[3].weight, w->sub_conv[3].bias,
-                sub_buf[1], SUB_CHANNELS, H, W, SUB_CHANNELS, 1, 1, 1, 0, 1, stream);
-    relu_inplace_fp16(sub_buf[1], SUB_CHANNELS * H * W, stream);
+    // Pointwise 1x1 conv = GEMM: out[256, H*W] = weight[256, 256] @ in[256, H*W]
+    gnn(/*X=*/w->sub_conv[3].weight, SUB_CHANNELS, SUB_CHANNELS,
+        /*W=*/sub_buf[0], H * W, /*Y=*/sub_buf[1]);
+    bias_relu_nchw_fp16(sub_buf[1], w->sub_conv[3].bias, SUB_CHANNELS, H * W, stream);
 
-    //    conv.5 (depthwise 256, 3x3, s=2) → conv.6 (pointwise 256→256, 1x1) → ReLU
+    //    conv.5 (depthwise 256, 3x3, s=2) → conv.6 (pointwise 256→256, 1x1) → bias+ReLU
     conv2d_fp16(sub_buf[1], w->sub_conv[5].weight, w->sub_conv[5].bias,
                 sub_buf[0], SUB_CHANNELS, H, W, SUB_CHANNELS, 3, 3, 2, 1, SUB_CHANNELS, stream);
     H = (H + 2 * 1 - 3) / 2 + 1;   // T' (encoder frames)
     W = (W + 2 * 1 - 3) / 2 + 1;   // 16
-    conv2d_fp16(sub_buf[0], w->sub_conv[6].weight, w->sub_conv[6].bias,
-                sub_buf[1], SUB_CHANNELS, H, W, SUB_CHANNELS, 1, 1, 1, 0, 1, stream);
-    relu_inplace_fp16(sub_buf[1], SUB_CHANNELS * H * W, stream);
+    // Pointwise 1x1 conv = GEMM: out[256, H*W] = weight[256, 256] @ in[256, H*W]
+    gnn(/*X=*/w->sub_conv[6].weight, SUB_CHANNELS, SUB_CHANNELS,
+        /*W=*/sub_buf[0], H * W, /*Y=*/sub_buf[1]);
+    bias_relu_nchw_fp16(sub_buf[1], w->sub_conv[6].bias, SUB_CHANNELS, H * W, stream);
 
     // Reshape [256, H, 16] → [H, 256*16] = [T', 4096] then linear → [T', 1024]
     // This is [C, H, W] → [H, C*W] (permute(1,0,2) + flatten)
@@ -909,34 +951,31 @@ void CudaModel::decoder_reset() {
 // ---------------------------------------------------------------------------
 
 half* CudaModel::decode_step(int enc_frame_idx, int prev_token) {
-    // Local GEMM helpers with fused bias epilogues
     auto gnn_b = [&](const half* X, int m, int k, const half* W, int n, const half* bias, half* Y) {
         gemm_nn_bias(cublaslt, cublas, lt_workspace, lt_workspace_size, stream, X, m, k, W, n, bias, Y);
     };
     auto gnt_b = [&](const half* X, int m, int k, const half* W, int n, const half* bias, half* Y) {
         gemm_nt_bias(cublaslt, cublas, lt_workspace, lt_workspace_size, stream, X, m, k, W, n, bias, Y);
     };
-    auto gnt_acc_b = [&](const half* X, int m, int k, const half* W, int n, const half* bias, half* Y) {
-        gemm_nt_accum_bias(cublaslt, cublas, lt_workspace, lt_workspace_size, stream, X, m, k, W, n, bias, Y);
-    };
 
-    // 1. Embedding gather
-    embedding_gather_fp16(w->embed_w, prev_token, dec_embed, D_PRED, stream);
+    // 1. Embed + concat with h[0] for LSTM0 input: lstm_input = [embed; h[0]]
+    embed_concat_fp16(w->embed_w, prev_token, lstm_h[0], lstm_input, D_PRED, stream);
 
-    // 2. LSTM layer 0 — bias fused into GEMM epilogues
-    gnt_b(dec_embed, 1, D_PRED, w->lstm0_w_ih, 4 * D_PRED, w->lstm0_bias, lstm_gates);
-    gnt_acc_b(lstm_h[0], 1, D_PRED, w->lstm0_w_hh, 4 * D_PRED, w->lstm0_bias + 4 * D_PRED, lstm_gates);
+    // 2. LSTM layer 0 — single cuBLAS call with combined [W_ih|W_hh] weights
+    gnt_b(lstm_input, 1, 2 * D_PRED, lstm_combined_w[0], 4 * D_PRED, lstm_combined_bias[0], lstm_gates);
     lstm_cell_fp16(lstm_gates, lstm_c[0], lstm_h_out[0], lstm_c_out[0], D_PRED, stream);
 
-    // 3. LSTM layer 1
-    gnt_b(lstm_h_out[0], 1, D_PRED, w->lstm1_w_ih, 4 * D_PRED, w->lstm1_bias, lstm_gates);
-    gnt_acc_b(lstm_h[1], 1, D_PRED, w->lstm1_w_hh, 4 * D_PRED, w->lstm1_bias + 4 * D_PRED, lstm_gates);
+    // 3. Concat h_out[0] with h[1] for LSTM1 input: lstm_input = [h_out[0]; h[1]]
+    concat_vectors_fp16(lstm_h_out[0], lstm_h[1], lstm_input, D_PRED, stream);
+
+    // 4. LSTM layer 1 — single cuBLAS call with combined weights
+    gnt_b(lstm_input, 1, 2 * D_PRED, lstm_combined_w[1], 4 * D_PRED, lstm_combined_bias[1], lstm_gates);
     lstm_cell_fp16(lstm_gates, lstm_c[1], lstm_h_out[1], lstm_c_out[1], D_PRED, stream);
 
-    // 4. Joint network — enc_proj precomputed in encode_gpu, saves 1 cuBLAS call/step
+    // 5. Joint network — cuBLAS for dec_proj + out_proj (multi-SM beats single-SM for 2MB weights)
     half* enc_proj_t = enc_proj_all + enc_frame_idx * D_JOINT;
-    gnn_b(lstm_h_out[1], 1, D_PRED, w->dec_proj_w, D_JOINT, w->dec_proj_b, dec_proj);
-    add_relu_fp16(enc_proj_t, dec_proj, joint_act, D_JOINT, stream);
+    gnn_b(lstm_h_out[1], 1, D_PRED, w->dec_proj_w, D_JOINT, w->dec_proj_b, dec_proj_buf);
+    add_relu_fp16(enc_proj_t, dec_proj_buf, joint_act, D_JOINT, stream);
     gnn_b(joint_act, 1, D_JOINT, w->out_proj_w, D_OUTPUT, w->out_proj_b, joint_out);
 
     return joint_out;

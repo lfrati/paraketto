@@ -1057,3 +1057,66 @@ Per-dataset breakdown:
 | **Total** | | **1003x** | **240** | **7236s** | **7.22s** |
 
 WER identical across all 240 utterances. The CUDA backend has now crossed 1000x RTFx — **1.9x faster than the original Python baseline** (529x) with zero external dependencies beyond CUDA.
+
+---
+
+### 10. Combined LSTM Weights + Subsampling Overhaul — 1001x → 1253x
+
+Two independent optimizations targeting different pipeline stages: the decoder's LSTM and the encoder's subsampling convolutions.
+
+#### Decoder: combined LSTM weights
+
+Each decode step ran two cuBLAS GEMMs per LSTM layer — one for `W_ih @ input` and one for `W_hh @ h_prev` — totaling 4 GEMM launches. Since these are M=1 GEMMs where kernel launch overhead (~5μs) rivals actual compute, reducing launch count matters.
+
+**Pre-combined weights at init:**
+- Horizontally concatenate `W_ih` and `W_hh` into `W_combined = [W_ih | W_hh]` of shape `[4*D, 2*D]` using `cudaMemcpy2DAsync` (same pattern as the existing QKV weight concatenation)
+- Pre-add biases: `bias_combined = b_ih + b_hh` via `residual_add_fp16`
+- At runtime, concatenate `[input; h_prev]` into a `[2*D]` vector, then one GEMM: `W_combined @ [input; h_prev] + bias_combined`
+
+**Two new helper kernels:**
+- `embed_concat_fp16`: embedding lookup + concat with h for LSTM layer 0 input prep — single block, half2 vectorized
+- `concat_vectors_fp16`: concat h_out with h for LSTM layer 1 input prep — same pattern
+
+This cuts per-step GPU operations from 11 to 7 (2 fewer cuBLAS launches, 1 fewer embedding kernel).
+
+#### Encoder: subsampling conv2d
+
+Profiling with `nsys` revealed the subsampling convolutions consumed **24.6% of total GPU time** — the single largest bottleneck. The culprit: a naive `conv2d_kernel` where each thread independently loads its input pixels with no data reuse.
+
+The subsampling pipeline has 5 convolutions:
+
+| Layer | Type | Shape | Time (est.) |
+|-------|------|-------|-------------|
+| conv.0 | regular 1→256, 3×3, stride 2 | [1, T_mel, 128] → [256, T/2, 64] | ~12ms |
+| conv.2 | depthwise 256, 3×3, stride 2 | [256, T/2, 64] → [256, T/4, 32] | ~2ms |
+| conv.3 | pointwise 256→256, 1×1 | [256, T/4, 32] → [256, T/4, 32] | ~1.5ms |
+| conv.5 | depthwise 256, 3×3, stride 2 | [256, T/4, 32] → [256, T/8, 16] | ~0.8ms |
+| conv.6 | pointwise 256→256, 1×1 | [256, T/8, 16] → [256, T/8, 16] | ~0.5ms |
+
+**conv.0 (the monster):** For 99s audio, this produces 256 × 4950 × 64 ≈ 81M output elements. With C_in=1, all 256 output channels read the *same* 9 input pixels per position — a 256× redundancy in global memory reads that the naive kernel doesn't exploit.
+
+Fix: **im2col + cuBLAS GEMM.** A new `im2col_2d_fp16` kernel extracts 3×3 patches into a `[9, H'×W']` matrix (stored in `ff_mid`, which is free during subsampling). Then cuBLAS computes `weight[256, 9] @ im2col[9, H'×W']` — a standard GEMM that cuBLAS executes at near-peak throughput across all SMs.
+
+**conv.3, conv.6 (pointwise):** A 1×1 convolution is just a matrix multiply along the channel dimension. `output[C_out, H×W] = weight[C_out, C_in] @ input[C_in, H×W]`. Replaced the per-element kernel with a single cuBLAS `gemm_nn` call.
+
+**Bias + ReLU:** Can't use cublasLt's bias epilogue here because the output is NCHW (channels in the leading row-major dimension, but the trailing col-major dimension). A new `bias_relu_nchw_fp16` kernel fuses the per-channel bias add and ReLU into one pass.
+
+The depthwise convolutions (conv.2, conv.5) remain on the naive kernel — they're only ~15% of subsampling time and each channel is independent, limiting the benefit of shared memory tiling.
+
+#### Results
+
+| Backend | Before | After | Improvement |
+|---------|--------|-------|-------------|
+| C++ CUDA | 1001x | **1253x** | **+25%** |
+
+Per-dataset breakdown:
+
+| Dataset | WER | RTFx | Utts | Audio | Time |
+|---------|-----|------|------|-------|------|
+| librispeech | 1.68% | 1108x | 100 | 896s | 809ms |
+| earnings22 | 16.48% | 999x | 40 | 253s | 253ms |
+| long | 1.90% | 1295x | 50 | 5578s | 4.31s |
+| difficult | 23.24% | 1255x | 50 | 509s | 406ms |
+| **Total** | | **1253x** | **240** | **7236s** | **5.78s** |
+
+WER identical across all 240 utterances. The CUDA backend is now **2.4x faster than the original Python baseline** (529x).

@@ -19,15 +19,6 @@ void layer_norm_fp16(const half* x, const half* gamma, const half* beta,
                      half* y, int N, int D, float eps, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// LayerNorm + residual: y = x_residual + alpha * LN(x)
-//   Fused residual addition with optional scale (alpha=0.5 for FF half-step).
-// ---------------------------------------------------------------------------
-void layer_norm_residual_fp16(const half* x, const half* x_residual,
-                              const half* gamma, const half* beta,
-                              half* y, int N, int D, float eps, float alpha,
-                              cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
 // Fused residual add + LayerNorm:
 //   x_out = x + alpha * delta  (update x in-place)
 //   ln_out = LN(x_out)         (normalize the updated x)
@@ -37,12 +28,6 @@ void residual_add_layer_norm_fp16(half* x, const half* delta, float alpha,
                                    const half* gamma, const half* beta,
                                    half* ln_out, int N, int D, float eps,
                                    cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
-// SiLU (Swish): y = x * sigmoid(x)
-//   Vectorized half2 pointwise kernel.
-// ---------------------------------------------------------------------------
-void silu_fp16(const half* x, half* y, int n, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // SiLU in-place: x = x * sigmoid(x)
@@ -55,19 +40,6 @@ void silu_inplace_fp16(half* x, int n, cudaStream_t stream);
 //   y = x[:, :D] * sigmoid(x[:, D:])
 // ---------------------------------------------------------------------------
 void glu_fp16(const half* x, half* y, int N, int D, cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
-// Bias add: y = x + bias (broadcast bias [D] over first dim)
-//   x, y: [N, D], bias: [D]
-// ---------------------------------------------------------------------------
-void bias_add_fp16(const half* x, const half* bias, half* y,
-                   int N, int D, cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
-// Bias add in-place: x += bias
-// ---------------------------------------------------------------------------
-void bias_add_inplace_fp16(half* x, const half* bias, int N, int D,
-                           cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // Add + ReLU (joint network): y = max(a + b, 0)
@@ -85,28 +57,11 @@ void dual_argmax_fp16(const half* logits, int* out,
                        int vocab_size, int total, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// Depthwise conv 1D, kernel=9, stride=1, padding=4 (same)
-//   x: [T, C]  (channels-last / row-major)
-//   w: [C, 1, 9]
-//   b: [C]
-//   y: [T, C]
-// ---------------------------------------------------------------------------
-void depthwise_conv1d_k9_fp16(const half* x, const half* w, const half* b,
-                              half* y, int T, int C, cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
 // Depthwise conv 1D, kernel=9 + SiLU fused
-//   Same as depthwise_conv1d_k9 but applies SiLU(x * sigmoid(x)) to the result.
+//   x: [T, C], w: [C, 1, 9], b: [C], y: [T, C]
 // ---------------------------------------------------------------------------
 void depthwise_conv1d_k9_silu_fp16(const half* x, const half* w, const half* b,
                                     half* y, int T, int C, cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
-// Softmax over last dimension
-//   x, y: [rows, cols]
-// ---------------------------------------------------------------------------
-void softmax_fp16(const half* x, half* y, int rows, int cols,
-                  cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // Fused LSTM cell (single step)
@@ -120,46 +75,22 @@ void lstm_cell_fp16(const half* gates, const half* c_prev,
                     half* h_out, half* c_out, int H, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// Fused LSTM step: W_ih @ x + W_hh @ h + bias + cell in one kernel
-//   x, h_prev, c_prev: [D]
-//   W_ih, W_hh: [4*D, D] (row-major, NT convention)
-//   bias: [8*D] = [b_ih(4*D), b_hh(4*D)]
-//   h_out, c_out: [D]
-//   One block, 256 threads. Eliminates 2 cuBLAS calls + 1 kernel per layer.
+// Embed + concat: out[0:D] = table[idx], out[D:2D] = h[0:D]
+//   table: [V, D], h: [D], out: [2*D]
+//   Single block, D/2 threads (half2 vectorized).
+//   Replaces embedding_gather + separate concat for LSTM0 input.
 // ---------------------------------------------------------------------------
-void fused_lstm_fp16(const half* x, const half* h_prev, const half* c_prev,
-                     const half* W_ih, const half* W_hh, const half* bias,
-                     half* h_out, half* c_out, int D, cudaStream_t stream);
+void embed_concat_fp16(const half* table, int idx, const half* h,
+                       half* out, int D, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// Fused joint network: dec_proj + add + relu + out_proj in one kernel
-//   lstm_h:    [D_pred]
-//   enc_proj:  [D_joint] (precomputed encoder projection for this frame)
-//   dec_w_t:   [D_joint, D_pred] transposed decoder projection weights
-//   dec_b:     [D_joint]
-//   out_w_t:   [D_out, D_joint] transposed output projection weights
-//   out_b:     [D_out]
-//   joint_out: [D_out]
-//   One block, 256 threads. Eliminates 2 cuBLAS + 1 custom kernel.
+// Concat two D-length vectors: out[0:D] = a, out[D:2D] = b
+//   a, b: [D], out: [2*D]
+//   Single block, D/2 threads (half2 vectorized).
+//   Used for LSTM1 input preparation.
 // ---------------------------------------------------------------------------
-void fused_joint_fp16(const half* lstm_h, const half* enc_proj,
-                      const half* dec_w_t, const half* dec_b,
-                      const half* out_w_t, const half* out_b,
-                      half* joint_out,
-                      int D_pred, int D_joint, int D_out,
-                      cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
-// Embedding gather: y = table[idx]
-//   table: [V, D], idx: scalar int, y: [D]
-// ---------------------------------------------------------------------------
-void embedding_gather_fp16(const half* table, int idx, half* y, int D,
-                           cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
-// FP16 -> FP32 cast
-// ---------------------------------------------------------------------------
-void cast_fp16_to_fp32(const half* x, float* y, int n, cudaStream_t stream);
+void concat_vectors_fp16(const half* a, const half* b,
+                         half* out, int D, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // FP32 -> FP16 cast
@@ -177,41 +108,6 @@ void transpose_fp16(const half* x, half* y, int M, int N, cudaStream_t stream);
 // ---------------------------------------------------------------------------
 void residual_add_fp16(const half* a, const half* b, half* y, int n,
                        float alpha, cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
-// Relative positional attention score computation
-//   Adds pos_bias_u/v to Q, computes content and position attention scores,
-//   applies softmax, and produces the weighted sum.
-//   This is split into multiple sub-steps called from C++ orchestration.
-// ---------------------------------------------------------------------------
-
-// Add pos_bias: q_u = q + pos_bias_u, q_v = q + pos_bias_v
-//   q: [heads, T, head_dim], pos_bias: [heads, head_dim]
-//   q_u, q_v: [heads, T, head_dim]
-void add_pos_bias_fp16(const half* q, const half* pos_bias,
-                       half* q_out, int heads, int T, int head_dim,
-                       cudaStream_t stream);
-
-// Dual add pos_bias: q_u = q + bias_u, q_v = q + bias_v in one pass
-void add_pos_bias_dual_fp16(const half* q,
-                             const half* bias_u, const half* bias_v,
-                             half* q_u, half* q_v,
-                             int heads, int T, int head_dim,
-                             cudaStream_t stream);
-
-// Relative position skew: convert [heads, T, 2T-1] position scores
-// to [heads, T, T] aligned scores via the Transformer-XL skew trick.
-void rel_pos_skew_fp16(const half* pos_scores, half* out,
-                       int heads, int T, cudaStream_t stream);
-
-// Same as above but also scales output by a factor (used for cuDNN SDPA bias pre-scaling)
-void rel_pos_skew_scale_fp16(const half* pos_scores, half* out,
-                              int heads, int T, float scale, cudaStream_t stream);
-
-// Scale + add two score matrices: out = (content + position) / sqrt(head_dim)
-void scale_add_scores_fp16(const half* content, const half* position,
-                           half* out, int heads, int T, float scale,
-                           cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // Fused skew + scale + softmax for relative position attention
@@ -240,16 +136,22 @@ void conv2d_fp16(const half* input, const half* weight, const half* bias,
                  cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// ReLU in-place: x = max(x, 0)
+// im2col for 2D convolution (NCHW format)
+//   input:  [C_in, H_in, W_in]
+//   col:    [C_in*kH*kW, H_out*W_out]  (row-major)
+//   Extracts sliding window patches for use with GEMM-based convolution.
 // ---------------------------------------------------------------------------
-void relu_inplace_fp16(half* x, int n, cudaStream_t stream);
+void im2col_2d_fp16(const half* input, half* col,
+                    int C_in, int H_in, int W_in,
+                    int kH, int kW, int stride, int pad,
+                    int H_out, int W_out, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// Reshape [C, H, W] -> [W, C*H] (NCHW to time-major for subsampling output)
-//   Reads element (c, h, w) and writes to (w, c*H + h)
+// Per-channel bias + ReLU for NCHW data (in-place)
+//   x[c, s] = max(x[c, s] + bias[c], 0) for s in [0, spatial)
 // ---------------------------------------------------------------------------
-void reshape_chw_to_wch_fp16(const half* in, half* out,
-                              int C, int H, int W, cudaStream_t stream);
+void bias_relu_nchw_fp16(half* x, const half* bias, int C, int spatial,
+                          cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // Reshape [C, H, W] -> [H, C*W] (permute(1,0,2) + flatten for subsampling)
@@ -276,17 +178,7 @@ void transpose_0213_fp16(const half* in, half* out,
                           int A, int B, int C, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// Split + transpose: [T, 3*heads*head_dim] -> 3x [heads, T, head_dim]
-//   Input is [T, 3*D] where D = heads*head_dim.
-//   Splits into 3 chunks along last dim and transposes [T, heads, head_dim] -> [heads, T, head_dim].
-// ---------------------------------------------------------------------------
-void split_transpose_3way_fp16(const half* in,
-                                half* out0, half* out1, half* out2,
-                                int T, int heads, int head_dim,
-                                cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
-// Fused split + transpose + pos_bias: [T, 3*D] → q_u, q_v (with bias), K, V
+// Fused split + transpose + pos_bias: [T, 3*D] -> q_u, q_v (with bias), K, V
 //   Reads QKV interleaved data once, writes:
 //     q_u[H,T,d] = Q[h,t,d] + bias_u[h,d]
 //     q_v[H,T,d] = Q[h,t,d] + bias_v[h,d]
@@ -300,15 +192,6 @@ void split_transpose_qkv_bias_fp16(const half* in,
                                     half* k, half* v,
                                     int T, int heads, int head_dim,
                                     cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
-// Batched 512-point R2C FFT → power spectrum
-//   frames: [n_frames, 512]  real windowed audio frames
-//   power:  [n_frames, 257]  |X[k]|² for k=0..256
-//   One thread block per frame, 256 threads, radix-2 Cooley-Tukey in shmem.
-// ---------------------------------------------------------------------------
-void fft512_power(const float* frames, float* power, int n_frames,
-                  cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // Mel filterbank entry for fused GPU mel pipeline
@@ -330,7 +213,7 @@ void mel_init_filterbank(const MelFBEntry* entries, int count);
 // Fused FFT + mel filterbank + log
 //   frames:  [n_frames, 512]  real windowed audio frames (float32)
 //   mel_out: [n_frames, 128]  log-mel spectrogram (float32)
-//   One block per frame, 256 threads. Fuses FFT → power → sparse mel → log.
+//   One block per frame, 256 threads. Fuses FFT -> power -> sparse mel -> log.
 // ---------------------------------------------------------------------------
 void fft512_mel_log(const float* frames, float* mel_out, int n_frames,
                     cudaStream_t stream);

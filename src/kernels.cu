@@ -96,82 +96,6 @@ void layer_norm_fp16(const half* x, const half* gamma, const half* beta,
 }
 
 // ---------------------------------------------------------------------------
-// LayerNorm + residual: y = x_residual + alpha * LN(x)
-// ---------------------------------------------------------------------------
-
-__global__ void layer_norm_residual_kernel(const half* __restrict__ x,
-                                           const half* __restrict__ x_res,
-                                           const half* __restrict__ gamma,
-                                           const half* __restrict__ beta,
-                                           half* __restrict__ y,
-                                           int N, int D, float eps, float alpha) {
-    int row = blockIdx.x;
-    if (row >= N) return;
-
-    const half* xr = x + row * D;
-    const half* rr = x_res + row * D;
-    half* yr = y + row * D;
-
-    float sum = 0.0f, sum2 = 0.0f;
-    for (int i = threadIdx.x; i < D; i += blockDim.x) {
-        float v = __half2float(xr[i]);
-        sum += v;
-        sum2 += v * v;
-    }
-
-    for (int mask = 16; mask > 0; mask >>= 1) {
-        sum  += __shfl_xor_sync(0xffffffff, sum, mask);
-        sum2 += __shfl_xor_sync(0xffffffff, sum2, mask);
-    }
-
-    __shared__ float s_sum[32], s_sum2[32];
-    int warp_id = threadIdx.x / 32;
-    int lane = threadIdx.x % 32;
-    if (lane == 0) { s_sum[warp_id] = sum; s_sum2[warp_id] = sum2; }
-    __syncthreads();
-
-    if (warp_id == 0) {
-        int nwarps = blockDim.x / 32;
-        sum  = (lane < nwarps) ? s_sum[lane] : 0.0f;
-        sum2 = (lane < nwarps) ? s_sum2[lane] : 0.0f;
-        for (int mask = 16; mask > 0; mask >>= 1) {
-            sum  += __shfl_xor_sync(0xffffffff, sum, mask);
-            sum2 += __shfl_xor_sync(0xffffffff, sum2, mask);
-        }
-    }
-
-    __shared__ float s_mean, s_inv_std;
-    if (threadIdx.x == 0) {
-        s_mean = sum / D;
-        float var = sum2 / D - s_mean * s_mean;
-        s_inv_std = rsqrtf(var + eps);
-    }
-    __syncthreads();
-
-    float mean = s_mean;
-    float inv_std = s_inv_std;
-
-    for (int i = threadIdx.x; i < D; i += blockDim.x) {
-        float v = __half2float(xr[i]);
-        float g = __half2float(gamma[i]);
-        float b = __half2float(beta[i]);
-        float ln = (v - mean) * inv_std * g + b;
-        float r = __half2float(rr[i]);
-        yr[i] = __float2half(r + alpha * ln);
-    }
-}
-
-void layer_norm_residual_fp16(const half* x, const half* x_residual,
-                              const half* gamma, const half* beta,
-                              half* y, int N, int D, float eps, float alpha,
-                              cudaStream_t stream) {
-    int threads = (D <= 1024) ? ((D + 31) / 32 * 32) : 1024;
-    if (threads < 32) threads = 32;
-    layer_norm_residual_kernel<<<N, threads, 0, stream>>>(
-        x, x_residual, gamma, beta, y, N, D, eps, alpha);
-}
-
-// ---------------------------------------------------------------------------
 // Fused residual add + LayerNorm
 //   x_out[row] = x[row] + alpha * delta[row]   (writes back to x)
 //   ln_out[row] = LN(x_out[row])               (normalized output)
@@ -253,22 +177,8 @@ void residual_add_layer_norm_fp16(half* x, const half* delta, float alpha,
 }
 
 // ---------------------------------------------------------------------------
-// SiLU
+// SiLU (in-place)
 // ---------------------------------------------------------------------------
-
-__global__ void silu_kernel(const half* __restrict__ x, half* __restrict__ y, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        float v = __half2float(x[i]);
-        y[i] = __float2half(v / (1.0f + expf(-v)));
-    }
-}
-
-void silu_fp16(const half* x, half* y, int n, cudaStream_t stream) {
-    int threads = 256;
-    int blocks = (n + threads - 1) / threads;
-    silu_kernel<<<blocks, threads, 0, stream>>>(x, y, n);
-}
 
 __global__ void silu_inplace_kernel(half* __restrict__ x, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -306,49 +216,6 @@ void glu_fp16(const half* x, half* y, int N, int D, cudaStream_t stream) {
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
     glu_kernel<<<blocks, threads, 0, stream>>>(x, y, N, D);
-}
-
-// ---------------------------------------------------------------------------
-// Bias add
-// ---------------------------------------------------------------------------
-
-__global__ void bias_add_kernel(const half* __restrict__ x,
-                                const half* __restrict__ bias,
-                                half* __restrict__ y,
-                                int N, int D) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = N * D;
-    if (idx < total) {
-        float v = __half2float(x[idx]) + __half2float(bias[idx % D]);
-        y[idx] = __float2half(v);
-    }
-}
-
-void bias_add_fp16(const half* x, const half* bias, half* y,
-                   int N, int D, cudaStream_t stream) {
-    int total = N * D;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    bias_add_kernel<<<blocks, threads, 0, stream>>>(x, bias, y, N, D);
-}
-
-__global__ void bias_add_inplace_kernel(half* __restrict__ x,
-                                        const half* __restrict__ bias,
-                                        int N, int D) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = N * D;
-    if (idx < total) {
-        float v = __half2float(x[idx]) + __half2float(bias[idx % D]);
-        x[idx] = __float2half(v);
-    }
-}
-
-void bias_add_inplace_fp16(half* x, const half* bias, int N, int D,
-                           cudaStream_t stream) {
-    int total = N * D;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    bias_add_inplace_kernel<<<blocks, threads, 0, stream>>>(x, bias, N, D);
 }
 
 // ---------------------------------------------------------------------------
@@ -456,47 +323,6 @@ void dual_argmax_fp16(const half* logits, int* out,
 }
 
 // ---------------------------------------------------------------------------
-// Depthwise conv 1D, kernel=9, stride=1, padding=4
-// Layout: x[T, C], w[C, 1, 9], b[C], y[T, C]
-// Each thread handles one (t, c) output element.
-// ---------------------------------------------------------------------------
-
-__global__ void depthwise_conv1d_k9_kernel(const half* __restrict__ x,
-                                           const half* __restrict__ w,
-                                           const half* __restrict__ b,
-                                           half* __restrict__ y,
-                                           int T, int C) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = T * C;
-    if (idx < total) {
-        int t = idx / C;
-        int c = idx % C;
-
-        float sum = 0.0f;
-        const half* wc = w + c * 9;
-
-        #pragma unroll
-        for (int k = 0; k < 9; k++) {
-            int ti = t + k - 4;  // padding=4
-            if (ti >= 0 && ti < T) {
-                sum += __half2float(x[ti * C + c]) * __half2float(wc[k]);
-            }
-        }
-
-        if (b) sum += __half2float(b[c]);
-        y[idx] = __float2half(sum);
-    }
-}
-
-void depthwise_conv1d_k9_fp16(const half* x, const half* w, const half* b,
-                              half* y, int T, int C, cudaStream_t stream) {
-    int total = T * C;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    depthwise_conv1d_k9_kernel<<<blocks, threads, 0, stream>>>(x, w, b, y, T, C);
-}
-
-// ---------------------------------------------------------------------------
 // Depthwise conv 1D, kernel=9 + SiLU fused
 // ---------------------------------------------------------------------------
 
@@ -537,75 +363,6 @@ void depthwise_conv1d_k9_silu_fp16(const half* x, const half* w, const half* b,
 }
 
 // ---------------------------------------------------------------------------
-// Softmax
-// ---------------------------------------------------------------------------
-
-__global__ void softmax_kernel(const half* __restrict__ x, half* __restrict__ y,
-                               int rows, int cols) {
-    int row = blockIdx.x;
-    if (row >= rows) return;
-
-    const half* xr = x + row * cols;
-    half* yr = y + row * cols;
-
-    // Find max
-    float max_val = -FLT_MAX;
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-        float v = __half2float(xr[i]);
-        if (v > max_val) max_val = v;
-    }
-    for (int mask = 16; mask > 0; mask >>= 1)
-        max_val = fmaxf(max_val, __shfl_xor_sync(0xffffffff, max_val, mask));
-
-    __shared__ float s_max[32];
-    int warp_id = threadIdx.x / 32, lane = threadIdx.x % 32;
-    if (lane == 0) s_max[warp_id] = max_val;
-    __syncthreads();
-    if (warp_id == 0) {
-        int nwarps = blockDim.x / 32;
-        max_val = (lane < nwarps) ? s_max[lane] : -FLT_MAX;
-        for (int mask = 16; mask > 0; mask >>= 1)
-            max_val = fmaxf(max_val, __shfl_xor_sync(0xffffffff, max_val, mask));
-    }
-    __shared__ float s_max_final;
-    if (threadIdx.x == 0) s_max_final = max_val;
-    __syncthreads();
-    max_val = s_max_final;
-
-    // Sum exp
-    float sum = 0.0f;
-    for (int i = threadIdx.x; i < cols; i += blockDim.x)
-        sum += expf(__half2float(xr[i]) - max_val);
-    for (int mask = 16; mask > 0; mask >>= 1)
-        sum += __shfl_xor_sync(0xffffffff, sum, mask);
-
-    __shared__ float s_sum[32];
-    if (lane == 0) s_sum[warp_id] = sum;
-    __syncthreads();
-    if (warp_id == 0) {
-        int nwarps = blockDim.x / 32;
-        sum = (lane < nwarps) ? s_sum[lane] : 0.0f;
-        for (int mask = 16; mask > 0; mask >>= 1)
-            sum += __shfl_xor_sync(0xffffffff, sum, mask);
-    }
-    __shared__ float s_sum_final;
-    if (threadIdx.x == 0) s_sum_final = 1.0f / sum;
-    __syncthreads();
-    float inv_sum = s_sum_final;
-
-    // Write output
-    for (int i = threadIdx.x; i < cols; i += blockDim.x)
-        yr[i] = __float2half(expf(__half2float(xr[i]) - max_val) * inv_sum);
-}
-
-void softmax_fp16(const half* x, half* y, int rows, int cols,
-                  cudaStream_t stream) {
-    int threads = (cols <= 1024) ? ((cols + 31) / 32 * 32) : 1024;
-    if (threads < 32) threads = 32;
-    softmax_kernel<<<rows, threads, 0, stream>>>(x, y, rows, cols);
-}
-
-// ---------------------------------------------------------------------------
 // LSTM cell
 // ---------------------------------------------------------------------------
 
@@ -643,188 +400,57 @@ void lstm_cell_fp16(const half* gates, const half* c_prev,
 }
 
 // ---------------------------------------------------------------------------
-// Fused LSTM step: GEMM + bias + cell in one kernel
-//   Shared memory: x[D] (half), h[D] (half), gates[4*D] (float)
-//   One block, 256 threads.
+// Embed + concat: out[0:D] = table[idx], out[D:2D] = h[0:D]
+// Single block, half2 vectorized.
 // ---------------------------------------------------------------------------
 
-__global__ void fused_lstm_kernel(
-        const half* __restrict__ x,
-        const half* __restrict__ h_prev,
-        const half* __restrict__ c_prev,
-        const half* __restrict__ W_ih,     // [4*D, D] row-major
-        const half* __restrict__ W_hh,     // [4*D, D] row-major
-        const half* __restrict__ bias,     // [8*D] = [b_ih(4*D), b_hh(4*D)]
-        half* __restrict__ h_out,
-        half* __restrict__ c_out,
-        int D) {
-    extern __shared__ char smem[];
-    half*  x_sh  = (half*)smem;
-    half*  h_sh  = x_sh + D;
-    float* gates = (float*)(h_sh + D);
-
+__global__ void embed_concat_kernel(const half* __restrict__ table,
+                                     int idx, const half* __restrict__ h,
+                                     half* __restrict__ out, int D) {
     int tid = threadIdx.x;
-    int nt  = blockDim.x;
-
-    // Phase 1: load x and h into shared memory
-    for (int i = tid; i < D; i += nt) {
-        x_sh[i] = x[i];
-        h_sh[i] = h_prev[i];
-    }
-    __syncthreads();
-
-    // Phase 2: gates = W_ih @ x + W_hh @ h + b_ih + b_hh
-    int n_gates = 4 * D;
-    for (int g = tid; g < n_gates; g += nt) {
-        float sum = __half2float(bias[g]) + __half2float(bias[n_gates + g]);
-        const half* wih = W_ih + (long long)g * D;
-        const half* whh = W_hh + (long long)g * D;
-        for (int k = 0; k < D; k += 2) {
-            half2 wi = *(const half2*)(wih + k);
-            half2 wh = *(const half2*)(whh + k);
-            half2 xv = *(const half2*)(x_sh + k);
-            half2 hv = *(const half2*)(h_sh + k);
-            sum += __half2float(wi.x) * __half2float(xv.x)
-                 + __half2float(wi.y) * __half2float(xv.y);
-            sum += __half2float(wh.x) * __half2float(hv.x)
-                 + __half2float(wh.y) * __half2float(hv.y);
-        }
-        gates[g] = sum;
-    }
-    __syncthreads();
-
-    // Phase 3: LSTM cell (gate order: i, o, f, g — ONNX convention)
-    for (int i = tid; i < D; i += nt) {
-        float gi = gates[i];
-        float go = gates[D + i];
-        float gf = gates[2 * D + i];
-        float gg = gates[3 * D + i];
-
-        float i_gate = 1.0f / (1.0f + expf(-gi));
-        float o_gate = 1.0f / (1.0f + expf(-go));
-        float f_gate = 1.0f / (1.0f + expf(-gf));
-        float c_gate = tanhf(gg);
-
-        float c = f_gate * __half2float(c_prev[i]) + i_gate * c_gate;
-        float h = o_gate * tanhf(c);
-
-        c_out[i] = __float2half(c);
-        h_out[i] = __float2half(h);
+    int D2 = D / 2;  // half2 count per vector
+    const half2* table2 = (const half2*)(table + idx * D);
+    const half2* h2 = (const half2*)h;
+    half2* out2 = (half2*)out;
+    // Each thread copies one half2 from embed and one from h
+    for (int i = tid; i < D2; i += blockDim.x) {
+        out2[i] = table2[i];        // out[0:D]
+        out2[D2 + i] = h2[i];       // out[D:2D]
     }
 }
 
-void fused_lstm_fp16(const half* x, const half* h_prev, const half* c_prev,
-                     const half* W_ih, const half* W_hh, const half* bias,
-                     half* h_out, half* c_out, int D, cudaStream_t stream) {
-    size_t smem = D * sizeof(half) * 2 + 4 * D * sizeof(float);
-    fused_lstm_kernel<<<1, 256, smem, stream>>>(
-        x, h_prev, c_prev, W_ih, W_hh, bias, h_out, c_out, D);
+void embed_concat_fp16(const half* table, int idx, const half* h,
+                       half* out, int D, cudaStream_t stream) {
+    embed_concat_kernel<<<1, 256, 0, stream>>>(table, idx, h, out, D);
 }
 
 // ---------------------------------------------------------------------------
-// Fused joint network: dec_proj + add + relu + out_proj in one kernel
-//   Phase 1: dec_proj[j] = W_dec_T[j,:] @ lstm_h + b_dec[j]
-//   Phase 2: joint_act[j] = relu(dec_proj[j] + enc_proj[j])
-//   Phase 3: out[j] = W_out_T[j,:] @ joint_act + b_out[j]
-//   Shared memory: lstm_h[D_pred] (half), joint_act[D_joint] (float)
-//   One block, 256 threads.
+// Concat two D-length vectors: out[0:D] = a, out[D:2D] = b
+// Single block, half2 vectorized.
 // ---------------------------------------------------------------------------
 
-__global__ void fused_joint_kernel(
-        const half* __restrict__ lstm_h,
-        const half* __restrict__ enc_proj,
-        const half* __restrict__ dec_w_t,    // [D_joint, D_pred] transposed
-        const half* __restrict__ dec_b,      // [D_joint]
-        const half* __restrict__ out_w_t,    // [D_out, D_joint] transposed
-        const half* __restrict__ out_b,      // [D_out]
-        half* __restrict__ joint_out,
-        int D_pred, int D_joint, int D_out) {
-    extern __shared__ char smem[];
-    half*  h_sh      = (half*)smem;
-    float* joint_act = (float*)(h_sh + D_pred);
-
+__global__ void concat_vectors_kernel(const half* __restrict__ a,
+                                       const half* __restrict__ b,
+                                       half* __restrict__ out, int D) {
     int tid = threadIdx.x;
-    int nt  = blockDim.x;
-
-    // Phase 1: load lstm_h into shared memory
-    for (int i = tid; i < D_pred; i += nt)
-        h_sh[i] = lstm_h[i];
-    __syncthreads();
-
-    // Phase 2: dec_proj + enc_proj + relu → joint_act (in shared memory)
-    for (int j = tid; j < D_joint; j += nt) {
-        float sum = __half2float(dec_b[j]);
-        const half* w_row = dec_w_t + (long long)j * D_pred;
-        for (int k = 0; k < D_pred; k += 2) {
-            half2 w = *(const half2*)(w_row + k);
-            half2 h = *(const half2*)(h_sh + k);
-            sum += __half2float(w.x) * __half2float(h.x)
-                 + __half2float(w.y) * __half2float(h.y);
-        }
-        sum += __half2float(enc_proj[j]);
-        joint_act[j] = fmaxf(sum, 0.0f);  // ReLU
-    }
-    __syncthreads();
-
-    // Phase 3: out_proj → joint_out
-    for (int j = tid; j < D_out; j += nt) {
-        float sum = __half2float(out_b[j]);
-        const half* w_row = out_w_t + (long long)j * D_joint;
-        for (int k = 0; k < D_joint; k += 2) {
-            half2 w = *(const half2*)(w_row + k);
-            sum += __half2float(w.x) * joint_act[k]
-                 + __half2float(w.y) * joint_act[k + 1];
-        }
-        joint_out[j] = __float2half(sum);
+    int D2 = D / 2;
+    const half2* a2 = (const half2*)a;
+    const half2* b2 = (const half2*)b;
+    half2* out2 = (half2*)out;
+    for (int i = tid; i < D2; i += blockDim.x) {
+        out2[i] = a2[i];
+        out2[D2 + i] = b2[i];
     }
 }
 
-void fused_joint_fp16(const half* lstm_h, const half* enc_proj,
-                      const half* dec_w_t, const half* dec_b,
-                      const half* out_w_t, const half* out_b,
-                      half* joint_out,
-                      int D_pred, int D_joint, int D_out,
-                      cudaStream_t stream) {
-    size_t smem = D_pred * sizeof(half) + D_joint * sizeof(float);
-    fused_joint_kernel<<<1, 256, smem, stream>>>(
-        lstm_h, enc_proj, dec_w_t, dec_b, out_w_t, out_b,
-        joint_out, D_pred, D_joint, D_out);
-}
-
-// ---------------------------------------------------------------------------
-// Embedding gather
-// ---------------------------------------------------------------------------
-
-__global__ void embedding_gather_kernel(const half* __restrict__ table,
-                                        int idx, half* __restrict__ y, int D) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < D) {
-        y[i] = table[idx * D + i];
-    }
-}
-
-void embedding_gather_fp16(const half* table, int idx, half* y, int D,
-                           cudaStream_t stream) {
-    int threads = 256;
-    int blocks = (D + threads - 1) / threads;
-    embedding_gather_kernel<<<blocks, threads, 0, stream>>>(table, idx, y, D);
+void concat_vectors_fp16(const half* a, const half* b,
+                         half* out, int D, cudaStream_t stream) {
+    concat_vectors_kernel<<<1, 256, 0, stream>>>(a, b, out, D);
 }
 
 // ---------------------------------------------------------------------------
 // FP16 <-> FP32 casts
 // ---------------------------------------------------------------------------
-
-__global__ void cast_fp16_to_fp32_kernel(const half* __restrict__ x,
-                                         float* __restrict__ y, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) y[i] = __half2float(x[i]);
-}
-
-void cast_fp16_to_fp32(const half* x, float* y, int n, cudaStream_t stream) {
-    int threads = 256;
-    int blocks = (n + threads - 1) / threads;
-    cast_fp16_to_fp32_kernel<<<blocks, threads, 0, stream>>>(x, y, n);
-}
 
 __global__ void cast_fp32_to_fp16_kernel(const float* __restrict__ x,
                                          half* __restrict__ y, int n) {
@@ -892,136 +518,6 @@ void residual_add_fp16(const half* a, const half* b, half* y, int n,
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     residual_add_kernel<<<blocks, threads, 0, stream>>>(a, b, y, n, alpha);
-}
-
-// ---------------------------------------------------------------------------
-// Add position bias: q_out[h, t, d] = q[h, t, d] + pos_bias[h, d]
-// ---------------------------------------------------------------------------
-
-__global__ void add_pos_bias_kernel(const half* __restrict__ q,
-                                    const half* __restrict__ pos_bias,
-                                    half* __restrict__ q_out,
-                                    int heads, int T, int head_dim) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = heads * T * head_dim;
-    if (idx < total) {
-        int h = idx / (T * head_dim);
-        int d = idx % head_dim;
-        float v = __half2float(q[idx]) + __half2float(pos_bias[h * head_dim + d]);
-        q_out[idx] = __float2half(v);
-    }
-}
-
-void add_pos_bias_fp16(const half* q, const half* pos_bias,
-                       half* q_out, int heads, int T, int head_dim,
-                       cudaStream_t stream) {
-    int total = heads * T * head_dim;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    add_pos_bias_kernel<<<blocks, threads, 0, stream>>>(
-        q, pos_bias, q_out, heads, T, head_dim);
-}
-
-// ---------------------------------------------------------------------------
-// Dual add position bias: q_u = q + bias_u, q_v = q + bias_v
-// Reads Q once, writes both outputs.
-// ---------------------------------------------------------------------------
-
-__global__ void add_pos_bias_dual_kernel(const half* __restrict__ q,
-                                          const half* __restrict__ bias_u,
-                                          const half* __restrict__ bias_v,
-                                          half* __restrict__ q_u,
-                                          half* __restrict__ q_v,
-                                          int heads, int T, int head_dim) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = heads * T * head_dim;
-    if (idx < total) {
-        int h = idx / (T * head_dim);
-        int d = idx % head_dim;
-        float qv = __half2float(q[idx]);
-        float bu = __half2float(bias_u[h * head_dim + d]);
-        float bv = __half2float(bias_v[h * head_dim + d]);
-        q_u[idx] = __float2half(qv + bu);
-        q_v[idx] = __float2half(qv + bv);
-    }
-}
-
-void add_pos_bias_dual_fp16(const half* q,
-                             const half* bias_u, const half* bias_v,
-                             half* q_u, half* q_v,
-                             int heads, int T, int head_dim,
-                             cudaStream_t stream) {
-    int total = heads * T * head_dim;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    add_pos_bias_dual_kernel<<<blocks, threads, 0, stream>>>(
-        q, bias_u, bias_v, q_u, q_v, heads, T, head_dim);
-}
-
-// ---------------------------------------------------------------------------
-// Relative position skew: [heads, T, 2T-1] -> [heads, T, T]
-// The Transformer-XL trick: pad, reshape, slice.
-// For each head h and row t, we extract columns [T-1-t .. 2T-2-t] from
-// the input [t, 0..2T-2] to get the aligned position scores.
-// ---------------------------------------------------------------------------
-
-__global__ void rel_pos_skew_kernel(const half* __restrict__ in,
-                                    half* __restrict__ out,
-                                    int heads, int T, float scale) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = heads * T * T;
-    if (idx < total) {
-        int h = idx / (T * T);
-        int rem = idx % (T * T);
-        int t = rem / T;
-        int j = rem % T;
-        // Input column for position (t, j): j + (T - 1 - t)
-        int src_col = j + T - 1 - t;
-        int W = 2 * T - 1;
-        float val = __half2float(in[h * T * W + t * W + src_col]);
-        out[idx] = __float2half(val * scale);
-    }
-}
-
-void rel_pos_skew_fp16(const half* pos_scores, half* out,
-                       int heads, int T, cudaStream_t stream) {
-    int total = heads * T * T;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    rel_pos_skew_kernel<<<blocks, threads, 0, stream>>>(pos_scores, out, heads, T, 1.0f);
-}
-
-void rel_pos_skew_scale_fp16(const half* pos_scores, half* out,
-                              int heads, int T, float scale, cudaStream_t stream) {
-    int total = heads * T * T;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    rel_pos_skew_kernel<<<blocks, threads, 0, stream>>>(pos_scores, out, heads, T, scale);
-}
-
-// ---------------------------------------------------------------------------
-// Scale + add scores: out = (content + position) * scale
-// ---------------------------------------------------------------------------
-
-__global__ void scale_add_scores_kernel(const half* __restrict__ content,
-                                        const half* __restrict__ position,
-                                        half* __restrict__ out,
-                                        int n, float scale) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        float v = (__half2float(content[i]) + __half2float(position[i])) * scale;
-        out[i] = __float2half(v);
-    }
-}
-
-void scale_add_scores_fp16(const half* content, const half* position,
-                           half* out, int heads, int T, float scale,
-                           cudaStream_t stream) {
-    int n = heads * T * T;
-    int threads = 256;
-    int blocks = (n + threads - 1) / threads;
-    scale_add_scores_kernel<<<blocks, threads, 0, stream>>>(
-        content, position, out, n, scale);
 }
 
 // ---------------------------------------------------------------------------
@@ -1172,46 +668,72 @@ void conv2d_fp16(const half* input, const half* weight, const half* bias,
 }
 
 // ---------------------------------------------------------------------------
-// ReLU in-place
+// im2col for 2D convolution (NCHW format)
+// Extracts patches: col[c*kH*kW + kh*kW + kw, oh*W_out + ow] = input[c, oh*s+kh-p, ow*s+kw-p]
 // ---------------------------------------------------------------------------
 
-__global__ void relu_inplace_kernel(half* __restrict__ x, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        float v = __half2float(x[i]);
-        if (v < 0.0f) x[i] = __float2half(0.0f);
-    }
-}
-
-void relu_inplace_fp16(half* x, int n, cudaStream_t stream) {
-    int threads = 256;
-    int blocks = (n + threads - 1) / threads;
-    relu_inplace_kernel<<<blocks, threads, 0, stream>>>(x, n);
-}
-
-// ---------------------------------------------------------------------------
-// Reshape [C, H, W] -> [W, C*H]
-// ---------------------------------------------------------------------------
-
-__global__ void reshape_chw_to_wch_kernel(const half* __restrict__ in,
-                                           half* __restrict__ out,
-                                           int C, int H, int W) {
+__global__ void im2col_2d_kernel(const half* __restrict__ input, half* __restrict__ col,
+                                  int C_in, int H_in, int W_in,
+                                  int kH, int kW, int stride, int pad,
+                                  int H_out, int W_out) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = C * H * W;
+    int col_rows = C_in * kH * kW;
+    int col_cols = H_out * W_out;
+    int total = col_rows * col_cols;
     if (idx >= total) return;
-    int w = idx / (C * H);
-    int ch = idx % (C * H);
-    int c = ch / H;
-    int h = ch % H;
-    out[idx] = in[c * H * W + h * W + w];
+
+    int spatial = idx % col_cols;
+    int patch = idx / col_cols;
+
+    int oh = spatial / W_out;
+    int ow = spatial % W_out;
+
+    int ic = patch / (kH * kW);
+    int kk = patch % (kH * kW);
+    int kh = kk / kW;
+    int kw = kk % kW;
+
+    int ih = oh * stride + kh - pad;
+    int iw = ow * stride + kw - pad;
+
+    half val = __float2half(0.0f);
+    if (ih >= 0 && ih < H_in && iw >= 0 && iw < W_in)
+        val = input[ic * H_in * W_in + ih * W_in + iw];
+
+    col[idx] = val;
 }
 
-void reshape_chw_to_wch_fp16(const half* in, half* out,
-                              int C, int H, int W, cudaStream_t stream) {
-    int total = C * H * W;
+void im2col_2d_fp16(const half* input, half* col,
+                    int C_in, int H_in, int W_in,
+                    int kH, int kW, int stride, int pad,
+                    int H_out, int W_out, cudaStream_t stream) {
+    int total = C_in * kH * kW * H_out * W_out;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    reshape_chw_to_wch_kernel<<<blocks, threads, 0, stream>>>(in, out, C, H, W);
+    im2col_2d_kernel<<<blocks, threads, 0, stream>>>(
+        input, col, C_in, H_in, W_in, kH, kW, stride, pad, H_out, W_out);
+}
+
+// ---------------------------------------------------------------------------
+// Per-channel bias + ReLU for NCHW data (in-place)
+// x is [C, spatial] row-major. Adds bias[c] to channel c, applies ReLU.
+// ---------------------------------------------------------------------------
+
+__global__ void bias_relu_nchw_kernel(half* __restrict__ x, const half* __restrict__ bias,
+                                       int C, int spatial) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= C * spatial) return;
+    int c = idx / spatial;
+    float val = __half2float(x[idx]) + __half2float(bias[c]);
+    x[idx] = __float2half(fmaxf(val, 0.0f));
+}
+
+void bias_relu_nchw_fp16(half* x, const half* bias, int C, int spatial,
+                          cudaStream_t stream) {
+    int total = C * spatial;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    bias_relu_nchw_kernel<<<blocks, threads, 0, stream>>>(x, bias, C, spatial);
 }
 
 // ---------------------------------------------------------------------------
@@ -1299,44 +821,6 @@ void transpose_0213_fp16(const half* in, half* out,
 }
 
 // ---------------------------------------------------------------------------
-// Split + transpose: [T, 3*heads*head_dim] -> 3x [heads, T, head_dim]
-// ---------------------------------------------------------------------------
-
-__global__ void split_transpose_3way_kernel(const half* __restrict__ in,
-                                             half* __restrict__ out0,
-                                             half* __restrict__ out1,
-                                             half* __restrict__ out2,
-                                             int T, int heads, int head_dim) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int D = heads * head_dim;
-    int total = T * D;  // each output has T*D elements
-    if (idx < total) {
-        int t = idx / D;
-        int rem = idx % D;
-        int h = rem / head_dim;
-        int d = rem % head_dim;
-        // Input: [T, 3*D], at row t, Q starts at col 0, K at D, V at 2*D
-        int in_row = t * 3 * D;
-        // Output: [heads, T, head_dim], element (h, t, d) at h*T*head_dim + t*head_dim + d
-        int out_idx = h * T * head_dim + t * head_dim + d;
-        out0[out_idx] = in[in_row + rem];           // Q
-        out1[out_idx] = in[in_row + D + rem];       // K
-        out2[out_idx] = in[in_row + 2 * D + rem];   // V
-    }
-}
-
-void split_transpose_3way_fp16(const half* in,
-                                half* out0, half* out1, half* out2,
-                                int T, int heads, int head_dim,
-                                cudaStream_t stream) {
-    int total = T * heads * head_dim;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    split_transpose_3way_kernel<<<blocks, threads, 0, stream>>>(
-        in, out0, out1, out2, T, heads, head_dim);
-}
-
-// ---------------------------------------------------------------------------
 // Fused split + transpose + pos_bias
 // Input: [T, 3*D], bias_u/bias_v: [heads, head_dim]
 // Output: q_u, q_v (with bias), K, V in [heads, T, head_dim]
@@ -1384,63 +868,6 @@ void split_transpose_qkv_bias_fp16(const half* in,
     int blocks = (total + threads - 1) / threads;
     split_transpose_qkv_bias_kernel<<<blocks, threads, 0, stream>>>(
         in, bias_u, bias_v, q_u, q_v, k, v, T, heads, head_dim);
-}
-
-// ---------------------------------------------------------------------------
-// Batched 512-point R2C FFT → power spectrum
-// One block per frame, 256 threads, radix-2 Cooley-Tukey in shared memory.
-// ---------------------------------------------------------------------------
-
-__global__ void fft512_power_kernel(const float* __restrict__ frames,
-                                     float* __restrict__ power,
-                                     int n_frames) {
-    int frame = blockIdx.x;
-    if (frame >= n_frames) return;
-
-    __shared__ float sr[512], si[512];
-    int tid = threadIdx.x;  // 0..255
-
-    // Bit-reversal load: each thread loads 2 elements
-    const float* in = frames + frame * 512;
-    int i0 = tid, i1 = tid + 256;
-    int br0 = __brev(i0) >> 23;  // 9-bit reversal
-    int br1 = __brev(i1) >> 23;
-    sr[br0] = in[i0];  si[br0] = 0.0f;
-    sr[br1] = in[i1];  si[br1] = 0.0f;
-    __syncthreads();
-
-    // 9 butterfly stages
-    for (int s = 0; s < 9; s++) {
-        int size = 1 << (s + 1);
-        int half_size = size >> 1;
-        int group = tid / half_size;
-        int k = tid % half_size;
-        int a = group * size + k;
-        int b = a + half_size;
-
-        float angle = -6.283185307179586f * k / size;
-        float wr, wi;
-        __sincosf(angle, &wi, &wr);
-
-        float tr = wr * sr[b] - wi * si[b];
-        float ti = wr * si[b] + wi * sr[b];
-        float ar = sr[a], ai = si[a];
-
-        sr[a] = ar + tr;  si[a] = ai + ti;
-        sr[b] = ar - tr;  si[b] = ai - ti;
-        __syncthreads();
-    }
-
-    // Write power spectrum: 257 bins (N/2+1)
-    float* out = power + frame * 257;
-    out[tid] = sr[tid] * sr[tid] + si[tid] * si[tid];
-    if (tid == 0)
-        out[256] = sr[256] * sr[256] + si[256] * si[256];
-}
-
-void fft512_power(const float* frames, float* power, int n_frames,
-                  cudaStream_t stream) {
-    fft512_power_kernel<<<n_frames, 256, 0, stream>>>(frames, power, n_frames);
 }
 
 // ---------------------------------------------------------------------------

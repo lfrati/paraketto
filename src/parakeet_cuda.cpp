@@ -14,13 +14,10 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
-#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
-
-#include <mutex>
-#include <thread>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -40,7 +37,6 @@
 static constexpr int N_FFT = 512;
 static constexpr int HOP = 160;
 static constexpr int N_MELS = 128;
-static constexpr int N_FREQ = N_FFT / 2 + 1;  // 257
 static constexpr float PREEMPH = 0.97f;
 static constexpr float LOG_EPS = 5.9604645e-08f;
 static constexpr float NORM_EPS = 1e-05f;
@@ -60,29 +56,6 @@ static constexpr float NORM_EPS = 1e-05f;
         }                                                                      \
     } while (0)
 #endif
-
-struct GpuBuf {
-    void* ptr = nullptr;
-    size_t bytes = 0;
-    GpuBuf() = default;
-    explicit GpuBuf(size_t n) : bytes(n) { CUDA_CHECK(cudaMalloc(&ptr, n)); }
-    ~GpuBuf() { if (ptr) cudaFree(ptr); }
-    GpuBuf(const GpuBuf&) = delete;
-    GpuBuf& operator=(const GpuBuf&) = delete;
-    GpuBuf(GpuBuf&& o) noexcept : ptr(o.ptr), bytes(o.bytes) { o.ptr = nullptr; }
-    GpuBuf& operator=(GpuBuf&& o) noexcept {
-        if (ptr) cudaFree(ptr);
-        ptr = o.ptr; bytes = o.bytes; o.ptr = nullptr;
-        return *this;
-    }
-    void resize(size_t n) {
-        if (n > bytes) {
-            if (ptr) cudaFree(ptr);
-            bytes = n;
-            CUDA_CHECK(cudaMalloc(&ptr, n));
-        }
-    }
-};
 
 // ---------------------------------------------------------------------------
 // WAV reader (16kHz mono, int16 or float32)
