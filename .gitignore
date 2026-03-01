@@ -42,5 +42,5 @@ engines/
 # Test/profiling caches
 .pytest_cache/
 
-# Downloaded dataset tarballs (re-downloadable via scripts/download_bench_data.py)
-data/*.tar.gz
+# Benchmark data (download via: make download-data)
+data/
