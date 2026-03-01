@@ -262,3 +262,12 @@ void split_transpose_qkv_bias_fp16(const half* in,
                                     half* k, half* v,
                                     int T, int heads, int head_dim,
                                     cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// Batched 512-point R2C FFT → power spectrum
+//   frames: [n_frames, 512]  real windowed audio frames
+//   power:  [n_frames, 257]  |X[k]|² for k=0..256
+//   One thread block per frame, 256 threads, radix-2 Cooley-Tukey in shmem.
+// ---------------------------------------------------------------------------
+void fft512_power(const float* frames, float* power, int n_frames,
+                  cudaStream_t stream);

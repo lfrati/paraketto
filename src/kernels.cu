@@ -1140,3 +1140,60 @@ void split_transpose_qkv_bias_fp16(const half* in,
         in, bias_u, bias_v, q_u, q_v, k, v, T, heads, head_dim);
 }
 
+// ---------------------------------------------------------------------------
+// Batched 512-point R2C FFT → power spectrum
+// One block per frame, 256 threads, radix-2 Cooley-Tukey in shared memory.
+// ---------------------------------------------------------------------------
+
+__global__ void fft512_power_kernel(const float* __restrict__ frames,
+                                     float* __restrict__ power,
+                                     int n_frames) {
+    int frame = blockIdx.x;
+    if (frame >= n_frames) return;
+
+    __shared__ float sr[512], si[512];
+    int tid = threadIdx.x;  // 0..255
+
+    // Bit-reversal load: each thread loads 2 elements
+    const float* in = frames + frame * 512;
+    int i0 = tid, i1 = tid + 256;
+    int br0 = __brev(i0) >> 23;  // 9-bit reversal
+    int br1 = __brev(i1) >> 23;
+    sr[br0] = in[i0];  si[br0] = 0.0f;
+    sr[br1] = in[i1];  si[br1] = 0.0f;
+    __syncthreads();
+
+    // 9 butterfly stages
+    for (int s = 0; s < 9; s++) {
+        int size = 1 << (s + 1);
+        int half_size = size >> 1;
+        int group = tid / half_size;
+        int k = tid % half_size;
+        int a = group * size + k;
+        int b = a + half_size;
+
+        float angle = -6.283185307179586f * k / size;
+        float wr, wi;
+        __sincosf(angle, &wi, &wr);
+
+        float tr = wr * sr[b] - wi * si[b];
+        float ti = wr * si[b] + wi * sr[b];
+        float ar = sr[a], ai = si[a];
+
+        sr[a] = ar + tr;  si[a] = ai + ti;
+        sr[b] = ar - tr;  si[b] = ai - ti;
+        __syncthreads();
+    }
+
+    // Write power spectrum: 257 bins (N/2+1)
+    float* out = power + frame * 257;
+    out[tid] = sr[tid] * sr[tid] + si[tid] * si[tid];
+    if (tid == 0)
+        out[256] = sr[256] * sr[256] + si[256] * si[256];
+}
+
+void fft512_power(const float* frames, float* power, int n_frames,
+                  cudaStream_t stream) {
+    fft512_power_kernel<<<n_frames, 256, 0, stream>>>(frames, power, n_frames);
+}
+

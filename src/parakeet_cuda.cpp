@@ -29,9 +29,8 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <cufft.h>
-
 #include "conformer.h"
+#include "kernels.h"
 #include "cpp-httplib/httplib.h"
 
 // ---------------------------------------------------------------------------
@@ -450,11 +449,10 @@ struct MelSpec {
     struct MelEntry { int mel_bin; float weight; };
     std::vector<std::vector<MelEntry>> sparse_fb;  // [N_FREQ]
 
-    cufftHandle fft_plan = 0;
-    int fft_plan_batch = 0;
-    float* d_frames = nullptr;
-    cufftComplex* d_fft_out = nullptr;
-    size_t frames_cap = 0, fft_cap = 0;
+    // GPU buffers for FFT (reused across calls, grow-only)
+    float* d_frames = nullptr;   // [n_frames, N_FFT]
+    float* d_power = nullptr;    // [n_frames, N_FREQ]
+    size_t frames_cap = 0, power_cap = 0;
 
     void init() {
         sparse_fb.resize(N_FREQ);
@@ -464,35 +462,22 @@ struct MelSpec {
     }
 
     ~MelSpec() {
-        if (fft_plan) cufftDestroy(fft_plan);
         if (d_frames) cudaFree(d_frames);
-        if (d_fft_out) cudaFree(d_fft_out);
+        if (d_power) cudaFree(d_power);
     }
 
-    void ensure_fft(int n_frames) {
+    void ensure_buffers(int n_frames) {
         size_t need_frames = (size_t)n_frames * N_FFT * sizeof(float);
         if (need_frames > frames_cap) {
             if (d_frames) cudaFree(d_frames);
             CUDA_CHECK(cudaMalloc(&d_frames, need_frames));
             frames_cap = need_frames;
         }
-        size_t need_fft = (size_t)n_frames * N_FREQ * sizeof(cufftComplex);
-        if (need_fft > fft_cap) {
-            if (d_fft_out) cudaFree(d_fft_out);
-            CUDA_CHECK(cudaMalloc(&d_fft_out, need_fft));
-            fft_cap = need_fft;
-        }
-        if (n_frames != fft_plan_batch) {
-            if (fft_plan) cufftDestroy(fft_plan);
-            int n[] = {N_FFT};
-            cufftResult rc = cufftPlanMany(&fft_plan, 1, n,
-                n, 1, N_FFT,
-                n, 1, N_FREQ,
-                CUFFT_R2C, n_frames);
-            if (rc != CUFFT_SUCCESS) {
-                fprintf(stderr, "cuFFT plan failed: %d\n", rc); std::exit(1);
-            }
-            fft_plan_batch = n_frames;
+        size_t need_power = (size_t)n_frames * N_FREQ * sizeof(float);
+        if (need_power > power_cap) {
+            if (d_power) cudaFree(d_power);
+            CUDA_CHECK(cudaMalloc(&d_power, need_power));
+            power_cap = need_power;
         }
     }
 
@@ -518,22 +503,16 @@ struct MelSpec {
             }
         }
 
-        ensure_fft(n_frames);
+        // Batched FFT → power spectrum on GPU
+        ensure_buffers(n_frames);
         CUDA_CHECK(cudaMemcpy(d_frames, frames.data(),
                                n_frames * N_FFT * sizeof(float),
                                cudaMemcpyHostToDevice));
-        cufftResult rc = cufftExecR2C(fft_plan, d_frames, d_fft_out);
-        if (rc != CUFFT_SUCCESS) {
-            fprintf(stderr, "cuFFT exec failed: %d\n", rc); std::exit(1);
-        }
-        std::vector<cufftComplex> fft_out(n_frames * N_FREQ);
-        CUDA_CHECK(cudaMemcpy(fft_out.data(), d_fft_out,
-                               n_frames * N_FREQ * sizeof(cufftComplex),
-                               cudaMemcpyDeviceToHost));
-
+        fft512_power(d_frames, d_power, n_frames, nullptr);
         std::vector<float> power(n_frames * N_FREQ);
-        for (int i = 0; i < n_frames * N_FREQ; i++)
-            power[i] = fft_out[i].x * fft_out[i].x + fft_out[i].y * fft_out[i].y;
+        CUDA_CHECK(cudaMemcpy(power.data(), d_power,
+                               n_frames * N_FREQ * sizeof(float),
+                               cudaMemcpyDeviceToHost));
 
         std::vector<float> mel(n_frames * N_MELS, 0.0f);
         for (int f = 0; f < n_frames; f++) {
@@ -694,7 +673,6 @@ struct Pipeline {
         weights.upload(stream);
 
         mel.init();
-        mel.ensure_fft(1000);
 
         cuda_model.init(weights, stream, 16000 * 120 / 160);  // 120s max audio
     }
