@@ -86,5 +86,26 @@ src/cutlass_gemm.o: src/cutlass_gemm.cu src/cutlass_gemm.h src/kernels.h
 paraketto.cuda: src/paraketto_cuda.cpp src/conformer.cpp src/conformer.h src/kernels.o src/cutlass_gemm.o src/kernels.h src/cutlass_gemm.h $(SHARED_HEADERS)
 	$(CXX) $(CUDA_CXXFLAGS) src/paraketto_cuda.cpp src/conformer.cpp src/kernels.o src/cutlass_gemm.o $(CUDA_LDFLAGS) -o $@
 
+# =========================================================================
+# Cudaless backend — direct ioctl GPU access, no libcuda/libcudart
+# =========================================================================
+NV_HEADERS     = third_party/nv-headers
+CUDALESS_CXXFLAGS = -std=c++17 -O3 -march=native -Wno-deprecated-declarations -I$(NV_HEADERS) -I$(NV_HEADERS)/uvm -Isrc
+CUDALESS_LDFLAGS  = -lpthread
+
+# GPU init smoke test (zero CUDA deps)
+gpu_test: tests/gpu_test.cpp src/gpu.h
+	$(CXX) $(CUDALESS_CXXFLAGS) $< -o $@
+
+# Compile kernels to CUBIN for cudaless loading
+kernels.cubin: src/kernels.cu src/kernels.h src/common.h
+	$(NVCC) -std=c++17 -O3 --cubin -arch=sm_120 -I$(CUDA_HOME)/include -Isrc $< -o $@
+
+# Side-by-side CUDA vs cudaless comparison test
+test_cudaless: tests/test_cudaless.cpp src/gpu.h src/cubin_loader.h src/kernels.o kernels.cubin
+	$(CXX) $(CUDALESS_CXXFLAGS) -I$(CUDA_HOME)/include \
+	    tests/test_cudaless.cpp src/kernels.o \
+	    -L$(CUDA_HOME)/lib64 -lcudart -o $@
+
 clean:
-	rm -f paraketto paraketto.cuda src/kernels.o src/cutlass_gemm.o
+	rm -f paraketto paraketto.cuda src/kernels.o src/cutlass_gemm.o gpu_test kernels.cubin test_cudaless
