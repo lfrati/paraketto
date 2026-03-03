@@ -1,4 +1,4 @@
-// wav.h — WAV file reader (16kHz mono, int16 or float32)
+// wav.h — WAV file reader (16kHz mono, int16 or float32, with 24kHz→16kHz resampling)
 #pragma once
 
 #include <cstdint>
@@ -8,6 +8,49 @@
 #include <fstream>
 #include <string>
 #include <vector>
+
+// Anti-aliasing FIR low-pass filter + linear interpolation resampler (24kHz → 16kHz).
+// 31-tap Hamming-windowed sinc, cutoff 7.5kHz @ 24kHz (-6dB at cutoff, -75dB @ 10kHz).
+static inline void resample_24k_to_16k(std::vector<float>& samples) {
+    static constexpr int NTAPS = 31;
+    static constexpr int HALF = NTAPS / 2;
+    static constexpr float FIR[NTAPS] = {
+        -1.5701712028e-03f,  1.4493850030e-03f,  1.1235023636e-03f, -4.4573699503e-03f,
+         2.5741981710e-03f,  6.9852126238e-03f, -1.3014500834e-02f,  1.1998184958e-17f,
+         2.4733691186e-02f, -2.5617997556e-02f, -1.8779901739e-02f,  6.7540830344e-02f,
+        -3.7078022474e-02f, -1.0818414642e-01f,  2.9144768982e-01f,  6.2569520132e-01f,
+         2.9144768982e-01f, -1.0818414642e-01f, -3.7078022474e-02f,  6.7540830344e-02f,
+        -1.8779901739e-02f, -2.5617997556e-02f,  2.4733691186e-02f,  1.1998184958e-17f,
+        -1.3014500834e-02f,  6.9852126238e-03f,  2.5741981710e-03f, -4.4573699503e-03f,
+         1.1235023636e-03f,  1.4493850030e-03f, -1.5701712028e-03f,
+    };
+
+    const int n_in = (int)samples.size();
+    if (n_in < NTAPS) return;
+
+    // Step 1: Apply FIR low-pass filter (anti-alias before decimation)
+    std::vector<float> filtered(n_in);
+    for (int i = 0; i < n_in; i++) {
+        float sum = 0;
+        for (int j = 0; j < NTAPS; j++) {
+            int idx = i - HALF + j;
+            if (idx >= 0 && idx < n_in) sum += samples[idx] * FIR[j];
+        }
+        filtered[i] = sum;
+    }
+
+    // Step 2: Resample 2/3 ratio via linear interpolation (1.5 input samples per output)
+    const int n_out = n_in * 2 / 3;
+    samples.resize(n_out);
+    for (int i = 0; i < n_out; i++) {
+        float pos = i * 1.5f;
+        int idx = (int)pos;
+        float frac = pos - idx;
+        float a = filtered[idx];
+        float b = (idx + 1 < n_in) ? filtered[idx + 1] : a;
+        samples[i] = a + frac * (b - a);
+    }
+}
 
 struct WavData {
     std::vector<float> samples;
@@ -45,7 +88,7 @@ static inline WavData read_wav(const std::string& path) {
     }
 
     if (num_channels != 1) { fprintf(stderr, "Need mono, got %d ch\n", num_channels); std::exit(1); }
-    if (sample_rate != 16000) { fprintf(stderr, "Need 16kHz, got %dHz: %s\n(resample with: ffmpeg -i input.wav -ar 16000 output.wav)\n", sample_rate, path.c_str()); std::exit(1); }
+    if (sample_rate != 16000 && sample_rate != 24000) { fprintf(stderr, "Need 16kHz (or 24kHz), got %dHz: %s\n(resample with: ffmpeg -i input.wav -ar 16000 output.wav)\n", sample_rate, path.c_str()); std::exit(1); }
 
     WavData wav;
     wav.sample_rate = sample_rate;
@@ -59,6 +102,7 @@ static inline WavData read_wav(const std::string& path) {
     } else {
         fprintf(stderr, "Unsupported fmt=%d bits=%d\n", audio_format, bits_per_sample); std::exit(1);
     }
+    if (wav.sample_rate == 24000) { resample_24k_to_16k(wav.samples); wav.sample_rate = 16000; }
     return wav;
 }
 
@@ -87,7 +131,7 @@ static inline WavData read_wav_from_memory(const char* buf, size_t len) {
         pos += sz;
     }
 
-    if (!raw_data || num_channels != 1 || sample_rate != 16000) return {};
+    if (!raw_data || num_channels != 1 || (sample_rate != 16000 && sample_rate != 24000)) return {};
 
     WavData wav;
     wav.sample_rate = sample_rate;
@@ -101,5 +145,6 @@ static inline WavData read_wav_from_memory(const char* buf, size_t len) {
     } else {
         return {};
     }
+    if (wav.sample_rate == 24000) { resample_24k_to_16k(wav.samples); wav.sample_rate = 16000; }
     return wav;
 }

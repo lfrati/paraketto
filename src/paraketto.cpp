@@ -279,10 +279,21 @@ private:
 // ---------------------------------------------------------------------------
 
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s [--engine-dir DIR] [--server [[host]:port]] <wav_file>...\n", argv[0]);
-        return 1;
-    }
+    auto usage = [&]() {
+        fprintf(stderr,
+            "Usage: %s [OPTIONS] <wav_file>...\n"
+            "\n"
+            "Speech-to-text using Paraketto (TensorRT backend).\n"
+            "Accepts one or more 16kHz or 24kHz mono WAV files (int16 or float32).\n"
+            "\n"
+            "Options:\n"
+            "  --engine-dir DIR           TensorRT engine directory [default: engines]\n"
+            "  --server [[host]:port]     Start HTTP server [default: 0.0.0.0:8080]\n"
+            "  -h, --help                 Show this help\n",
+            argv[0]);
+    };
+
+    if (argc < 2) { usage(); return 1; }
 
     std::string engine_dir = "engines";
     std::vector<std::string> wav_files;
@@ -292,6 +303,7 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") { usage(); return 0; }
         if (arg == "--engine-dir" && i + 1 < argc) {
             engine_dir = argv[++i];
         } else if (arg == "--server") {

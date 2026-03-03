@@ -122,10 +122,21 @@ private:
 // ---------------------------------------------------------------------------
 
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s [--weights FILE] [--server [[host]:port]] <wav_file>...\n", argv[0]);
-        return 1;
-    }
+    auto usage = [&]() {
+        fprintf(stderr,
+            "Usage: %s [OPTIONS] <wav_file>...\n"
+            "\n"
+            "Speech-to-text using Paraketto (CUDA/cuBLAS backend).\n"
+            "Accepts one or more 16kHz or 24kHz mono WAV files (int16 or float32).\n"
+            "\n"
+            "Options:\n"
+            "  --weights FILE             Model weights [default: weights.bin]\n"
+            "  --server [[host]:port]     Start HTTP server [default: 0.0.0.0:8080]\n"
+            "  -h, --help                 Show this help\n",
+            argv[0]);
+    };
+
+    if (argc < 2) { usage(); return 1; }
 
     std::string weights_path = "weights.bin";
     std::vector<std::string> wav_files;
@@ -135,6 +146,7 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") { usage(); return 0; }
         if (arg == "--weights" && i + 1 < argc) {
             weights_path = argv[++i];
         } else if (arg == "--server") {
@@ -218,26 +230,22 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // CLI mode: warmup with first file
-    auto warmup_wav = read_wav(wav_files[0]);
-    pipeline.transcribe(warmup_wav.samples.data(), warmup_wav.samples.size());
-    auto t_warmup_done = clk::now();
+    auto t_ready = clk::now();
 
     auto ms = [](auto a, auto b) { return std::chrono::duration<double,std::milli>(b-a).count(); };
-    fprintf(stderr, "startup: %.0fms (cuda=%.0f prefetch=%.0f load=%.0f warmup=%.0f)\n",
-            ms(t_main_start, t_warmup_done), ms(t_main_start, t_cuda_init),
+    fprintf(stderr, "startup: %.0fms (cuda=%.0f prefetch=%.0f load=%.0f)\n",
+            ms(t_main_start, t_ready), ms(t_main_start, t_cuda_init),
             ms(t_main_start, t_prefetch),
-            ms(t_prefetch, t_init_done),
-            ms(t_init_done, t_warmup_done));
+            ms(t_prefetch, t_init_done));
 
-    // Process each file
+    // Process all files
     for (size_t fi = 0; fi < wav_files.size(); fi++) {
-        WavData wav = (fi == 0) ? std::move(warmup_wav) : read_wav(wav_files[fi]);
+        WavData wav = read_wav(wav_files[fi]);
         double audio_dur = (double)wav.samples.size() / wav.sample_rate;
 
-        auto t0 = std::chrono::high_resolution_clock::now();
+        auto t0 = clk::now();
         std::string text = pipeline.transcribe(wav.samples.data(), wav.samples.size());
-        auto t1 = std::chrono::high_resolution_clock::now();
+        auto t1 = clk::now();
 
         double elapsed = std::chrono::duration<double>(t1 - t0).count();
         printf("%s\n", text.c_str());
