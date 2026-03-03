@@ -574,7 +574,7 @@ extern "C" {
 
 ### 13c. CUTLASS Params layout (reverse-engineered)
 
-Using `tests/sniff_cutlass2.cu` (constructs Params via CUTLASS API and dumps
+Using `tools/sniff_cutlass2.cu` (constructs Params via CUTLASS API and dumps
 raw bytes), we verified the 368-byte Params layout for all variants:
 
 **Non-batched Gemm Params (368 bytes):**
@@ -662,10 +662,10 @@ src/cuda_stubs.cpp       — CUDA runtime stubs (~20 lines)
 tests/test_launch.cpp    — single-kernel end-to-end test
 tests/test_kernels.cpp   — 24-kernel test harness (all custom kernels + fft512_mel_log)
 tests/test_cutlass_cudaless.cpp — CUTLASS GEMM test (4 variants vs CPU reference)
-tests/sniff_cutlass2.cu  — RE tool: dump CUTLASS Params layout
-tests/sniff_cbuf0.cu     — RE tool: dump cbuf0 from CUDA
-tests/sniff_qmd2.cu      — RE tool: dump QMD from CUDA
-tests/sniff_semaphore.cu — RE tool: find semaphore writes
+tools/sniff_cutlass2.cu  — RE tool: dump CUTLASS Params layout
+tools/sniff_cbuf0.cu     — RE tool: dump cbuf0 from CUDA
+tools/sniff_qmd2.cu      — RE tool: dump QMD from CUDA
+tools/sniff_semaphore.cu — RE tool: find semaphore writes
 third_party/nv-headers/  — vendored NVIDIA headers (MIT)
 ```
 

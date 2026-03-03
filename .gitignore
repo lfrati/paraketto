@@ -51,3 +51,18 @@ test.wav
 
 # Benchmark data (download via: make download-data)
 data/
+
+# Cudaless build artifacts
+*.cubin
+gpu_test
+test_kernels
+test_launch
+test_cudaless
+test_cutlass_cudaless
+test_cutlass_bridge
+sniff_cbuf0
+sniff_cutlass
+sniff_cutlass2
+sniff_qmd2
+sniff_semaphore
+recovered/
