@@ -140,9 +140,9 @@ We launched a kernel via CUDA and scanned process memory for the QMD
 
 ```
 DW[ 4] = 0x013f0000    qmd_type=2 (GRID_CTA), qmd_group_id=0x3F
-DW[ 9] = 0x00000003    RELEASE0_ENABLE=1, RELEASE_STRUCTURE_SIZE=1
-DW[10] = 0x00190000    (unknown, but required)
-DW[12] = 0x02070100    SM_GLOBAL_CACHING + other flags
+DW[ 9] = 0x00000000    QMD release disabled (set by wait_kernel when needed)
+DW[10] = 0x00000000    DEPENDENT_QMD0 fields (set by chaining code, not template)
+DW[12] = 0x00000000    DEPENDENT_QMD0_POINTER (set by chaining code, not template)
 DW[14] = 0x2f5003a4    sass_version=0xA4, sampler_index=1, qmd_major_version=5
 DW[19] = 0x80610000    cwd_membar_type=1 + flags
 DW[20] = 0x00000008    (unknown, but required)
@@ -331,50 +331,43 @@ signal completion) took days of debugging.
 | Semaphore in GPFIFO memory (write-combined) | Never writes | Same underlying issue — WFI hang. |
 | SET_OBJECT on subchannel 0 | No effect | Not needed — subchannel 0 methods are always handled by host. |
 
-### What works
+### What works (current approach — single GPFIFO entry)
 
-**Separate GPFIFO entry + plain RELEASE (no WFI):**
+With dependent QMD chaining, everything goes in ONE pushbuffer + ONE GPFIFO
+entry. The last kernel's QMD has a release semaphore, plus a HOST SEM with
+RELEASE_WFI as backup:
 
 ```c
-// Entry 1: kernel dispatch (at cmdq offset 0)
-cmd_begin();
-nvm(1, 0x02B4, 1); nvm_data(qmd_addr >> 8);    // SEND_PCAS_A
-nvm(1, 0x02C0, 1); nvm_data(9);                  // SEND_SIGNALING_PCAS2_B
-submit_compute();                                  // → GPFIFO entry 0
+begin_commands();
+// First kernel: SEND_PCAS
+nvm(1, 0x02B4, 1); nvm_data(qmd0_addr >> 8);
+nvm(1, 0x02C0, 1); nvm_data(9);    // SEND_SIGNALING_PCAS2_B
+// Kernels 2..N: linked via dependent_qmd0 (no pushbuffer commands needed)
 
-// Entry 2: semaphore release (at cmdq offset 1MB — different memory!)
-cmdq_offset = 0x100000;
+// wait_kernel():
+// Set QMD release semaphore on last kernel
+last_qmd->set_release_semaphore(0, sem_addr, counter);
+last_qmd->set(336, 336, 0);  // disable dependent chaining on last kernel
+// Append HOST semaphore with RELEASE_WFI
 nvm(0, 0x005C, 5);
-nvm_data(sem_addr_lo);       // SEM_ADDR_LO
-nvm_data(sem_addr_hi);       // SEM_ADDR_HI
-nvm_data(payload_lo);        // SEM_PAYLOAD_LO
-nvm_data(payload_hi);        // SEM_PAYLOAD_HI
-nvm_data(0x01000001);        // SEM_EXECUTE: RELEASE + 64BIT (no WFI!)
-submit_compute();             // → GPFIFO entry 1
+nvm_data(sem_addr_lo); nvm_data(sem_addr_hi);
+nvm_data(counter_lo); nvm_data(counter_hi);
+nvm_data(0x01100001);    // SEM_EXECUTE: RELEASE + RELEASE_WFI + 64BIT
+submit_compute();         // single GPFIFO entry
 ```
 
-**Key insights:**
+**SEM_EXECUTE value = 0x01100001:**
+- bit 0 = OPERATION_RELEASE (write payload to address)
+- bit 20 = RELEASE_WFI (wait for all in-flight work before writing)
+- bit 24 = PAYLOAD_SIZE_64BIT
 
-1. **Must be a separate GPFIFO entry.** HOST methods (subchannel 0) and compute
-   methods (subchannel 1) cannot coexist in the same pushbuffer segment. The
-   HOST engine processes its methods only at GPFIFO entry boundaries.
+### Historical note: the old 2-entry approach
 
-2. **Must use a different command queue offset.** Both GPFIFO entries are
-   submitted nearly simultaneously. If entry 2 reuses offset 0, it overwrites
-   the kernel dispatch commands before the GPU fetches them (race condition).
-
-3. **No WFI.** `RELEASE_WFI` causes the HOST engine to hang waiting for
-   "all prior work to complete." After a `SEND_PCAS` async dispatch, the HOST
-   engine's concept of "idle" never becomes true. Plain `RELEASE` fires
-   immediately — but since GPFIFO entries are processed in order, and the
-   compute engine was scheduled by entry 1, the semaphore write in entry 2
-   cannot execute until entry 1 has been fully processed by the FIFO.
-
-4. **SEM_EXECUTE value = 0x01000001:**
-   - bit 0 = OPERATION_RELEASE (write payload to address)
-   - bit 24 = PAYLOAD_SIZE_64BIT
-   - NO bit 20 (WFI)
-   - NO bit 25 (RELEASE_TIMESTAMP — optional, tinygrad uses it, not required)
+Before dependent QMD chaining, each kernel was dispatched via SEND_PCAS, and
+synchronization required **two separate GPFIFO entries** — HOST methods and
+compute methods couldn't coexist in one pushbuffer, and RELEASE_WFI would
+hang. With chaining, the single-entry approach works because the HOST SEM
+fires after the entire chain completes.
 
 ### CPU polling
 
@@ -414,35 +407,44 @@ class definitions (clcdc0qmd.h), but many practical details (which fields
 are required, what values the driver uses, the cbuf0 template layout) can
 only be discovered empirically.
 
-## 11. Constant Buffer 2 (cbuf2) — `__constant__` Memory
+## 11. Constant Buffer 3 (cbuf3) — `__constant__` Memory on SM120
 
-Some kernels read data from `__constant__` memory, which maps to constant
-buffer 2 in the QMD. For example, `fft512_mel_log_kernel` reads a 504-entry
-mel filterbank table from `__constant__`.
+Some kernels read data from `__constant__` memory. On **SM120 (Blackwell)**,
+`__constant__` maps to constant buffer **3** (not 2 as on older architectures).
+For example, `fft512_mel_log_kernel` reads a 504-entry mel filterbank table
+from `__constant__`.
 
 ### CUBIN parsing
 
-The `.nv.constant2.<mangled_name>` ELF section contains the `__constant__`
-data and its size tells us how large cbuf2 is. The cubin loader extracts this
-alongside cbuf0:
+The `.nv.constant3` ELF section is a **global** (not per-kernel) section that
+contains all `__constant__` data for the compilation unit. On SM120, there are
+no `.nv.constant2` sections at all.
 
 ```
-.nv.constant0.<name>  →  cbuf0_size (kernel args + driver template)
-.nv.constant2.<name>  →  cbuf2_size (__constant__ data)
+.nv.constant0.<name>  →  cbuf0_size (per-kernel: driver template + kernel args)
+.nv.constant3          →  cbuf3_size (global: all __constant__ data, shared across kernels)
 ```
 
-### QMD setup for cbuf2
+For the mel filterbank: `.nv.constant3` is 4032 bytes = 504 entries × 8 bytes,
+exactly matching the `c_mel_fb[504]` array.
 
-Same encoding as cbuf0 (DW[42-43]) but at DW[46-47]:
+### QMD setup for cbuf3
+
+Same encoding as cbuf0 (DW[42-43]) but at DW[48-49] (idx=3):
 
 ```
-DW[46] = (cbuf2_gpu_addr >> 6) & 0xFFFFFFFF
-DW[47] = ((cbuf2_gpu_addr >> 38) & 0x7FFFF) | ((cbuf2_size >> 4) << 19)
-DW[58] |= (1 << 8)    // set cbuf2 valid bit (0x11 → 0x111)
+DW[48] = (cbuf3_gpu_addr >> 6) & 0xFFFFFFFF
+DW[49] = ((cbuf3_gpu_addr >> 38) & 0x7FFFF) | ((cbuf3_size >> 4) << 19)
+DW[58] |= (1 << 12)    // set cbuf3 valid bit (bit 1864 = 1856 + 3*4)
 ```
 
-The cbuf2 data is uploaded to a separate GPU allocation. The kernel reads it
-via `LDC c[0x2][offset]` instructions.
+The cbuf3 data is uploaded to a separate GPU allocation. The kernel reads it
+via `LDC c[0x3][offset]` instructions.
+
+**Discovery**: Initially we assumed cbuf2 (matching older architectures). All
+mel outputs were `log(eps) = -16.635`, indicating zero weights. `readelf -S`
+on the cubin revealed no `.nv.constant2` sections — only `.nv.constant3`
+(4032 bytes). Changing to cbuf3 (DW[48-49], valid bit 12) fixed it.
 
 ## 12. Dependent QMD Chaining — Unlimited Dispatches
 
@@ -493,6 +495,28 @@ Last kernel:
 ```
 
 This gives unlimited sequential dispatches with a single GPFIFO submission.
+
+### Critical: clearing DEPENDENT_QMD0_ENABLE on the last kernel
+
+The CUDA-captured QMD template had `DW[10] = 0x00190000` which included
+`DEPENDENT_QMD0_ENABLE=1` (bit 336) with a garbage pointer in `DW[12]`.
+Before chaining, all kernels were dispatched via SEND_PCAS, and the GPU
+ignores `dependent_qmd0` fields for SEND_PCAS-dispatched kernels — so
+the stale bits were harmless.
+
+With chaining, kernels 2–N are dispatched **as dependents**, and the GPU
+DOES check their `dependent_qmd0` fields on completion. The chaining code
+correctly overwrites these fields on kernels 1 through N-1 (to point to
+the next kernel). But the **last kernel** kept the template's `ENABLE=1`
+with garbage pointer `0x02070100`, causing the GPU to chase
+`0x02070100 << 8 = 0x20701000000` — unmapped memory → GPU fault →
+semaphore never written → infinite CPU poll.
+
+**Fix**: Clear `dependent_qmd0` fields from the template (`DW[10]=0`,
+`DW[12]=0`) and explicitly disable on the last QMD in `wait_kernel()`:
+```cpp
+last->set(336, 336, 0);  // Disable dependent_qmd0 on last kernel
+```
 
 ### QMD release semaphore
 
@@ -652,7 +676,7 @@ src/gpu.h                — single-header GPU driver (~1050 lines)
                            init, alloc, launch_kernel (dependent QMD chaining),
                            wait_kernel (QMD release semaphore), prepare_cbuf0
 src/cubin_loader.h       — CUBIN ELF parser (~350 lines)
-                           .text, .nv.info, .nv.constant0, .nv.constant2, .nv.shared
+                           .text, .nv.info, .nv.constant0, .nv.constant3, .nv.shared
 src/cutlass_cudaless.h   — CUTLASS GEMM wrapper (~250 lines)
                            cubin load, kernel identification, row→col conversion
 src/cutlass_params.cu    — nvcc-compiled Params bridge (~340 lines)
@@ -691,18 +715,19 @@ ldd test_cutlass_cudaless
 
 ## 16. What's Next
 
-- **GPU testing**: Run test_kernels (24/24) and test_cutlass_cudaless on actual hardware
-- **Phase 4**: Wire up full inference (paraketto_cudaless.cpp) — replace cudaMalloc/cudaMemcpy
-  with gpu.h, replace CUTLASS calls with cutlass_cudaless.h, run end-to-end transcription
+- **Full inference**: Wire up paraketto_cudaless.cpp end-to-end — all custom kernels
+  and CUTLASS GEMM launch via gpu.h, zero CUDA runtime dependencies
+- **Performance**: Measure RTFx, compare against CUDA path
 
 ## 17. Key Numbers
 
 | Metric | Value |
 |--------|-------|
+| Full test (init + 24 kernels + verify) | 150ms wall clock |
 | GPU init time | ~50ms (20 RM ioctls + UVM setup) |
 | Kernel launch overhead | <10us (QMD build + GPFIFO submit) |
 | Semaphore latency | ~140 spins for 4096-element FP16 kernel |
-| Custom kernels tested | 24 (23 original + fft512_mel_log via cbuf2) |
+| Custom kernels tested | 24/24 passing (23 original + fft512_mel_log via cbuf3) |
 | CUTLASS variants | 10 (6 non-batched, 4 batched) |
 | CUTLASS cubin size | 502 KB (sm_120) |
 | Params struct size | 368 bytes (all variants) |
