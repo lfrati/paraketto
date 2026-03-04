@@ -872,7 +872,7 @@ public:
                        uint32_t grid_x, uint32_t grid_y, uint32_t grid_z,
                        uint32_t block_x, uint32_t block_y, uint32_t block_z,
                        uint64_t cbuf0_gpu_addr, uint32_t cbuf0_size,
-                       uint64_t cbuf2_gpu_addr = 0, uint32_t cbuf2_size = 0) {
+                       uint64_t cbuf3_gpu_addr = 0, uint32_t cbuf3_size = 0) {
         // Auto-start pushbuffer if needed
         if (!pb_started) begin_commands();
 
@@ -921,13 +921,13 @@ public:
         qmd.dw[42] = (uint32_t)(cb0_addr_s6 & 0xFFFFFFFF);
         qmd.dw[43] = ((uint32_t)(cb0_addr_s6 >> 32) & 0x7FFFF) | (cb0_size_s4 << 19);
 
-        // Constant buffer 2 (optional — for __constant__ data like mel filterbank)
-        if (cbuf2_size > 0 && cbuf2_gpu_addr != 0) {
-            uint64_t cb2_addr_s6 = cbuf2_gpu_addr >> 6;
-            uint32_t cb2_size_s4 = (cbuf2_size + 15) / 16;
-            qmd.dw[46] = (uint32_t)(cb2_addr_s6 & 0xFFFFFFFF);
-            qmd.dw[47] = ((uint32_t)(cb2_addr_s6 >> 32) & 0x7FFFF) | (cb2_size_s4 << 19);
-            qmd.dw[58] |= (1 << 8);  // cbuf2 valid bit
+        // Constant buffer 3 (optional — SM120 uses cbuf3 for __constant__ data)
+        if (cbuf3_size > 0 && cbuf3_gpu_addr != 0) {
+            uint64_t cb3_addr_s6 = cbuf3_gpu_addr >> 6;
+            uint32_t cb3_size_s4 = (cbuf3_size + 15) / 16;
+            qmd.dw[48] = (uint32_t)(cb3_addr_s6 & 0xFFFFFFFF);
+            qmd.dw[49] = ((uint32_t)(cb3_addr_s6 >> 32) & 0x7FFFF) | (cb3_size_s4 << 19);
+            qmd.dw[58] |= (1 << 12);  // cbuf3 valid bit
         }
 
         // Program prefetch

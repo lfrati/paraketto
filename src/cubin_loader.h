@@ -32,9 +32,6 @@ struct CubinKernel {
     uint32_t local_mem_low;
     uint32_t local_mem_high;
 
-    // From .nv.constant2.<name>
-    uint32_t cbuf2_size;        // total cbuf2 size (from .nv.constant2, 0 if none)
-
     // From .nv.shared.<name>
     uint32_t shared_mem_size;
 
@@ -63,6 +60,10 @@ public:
         uint32_t shndx;
     };
     std::vector<SymInfo> symbols;
+
+    // Global .nv.constant3 — SM120 uses cbuf3 for __constant__ data
+    uint64_t cbuf3_offset = 0;  // offset within ELF image
+    uint32_t cbuf3_size = 0;    // size in bytes (0 if none)
 
     // Section offsets (ELF file offsets, for computing GPU addresses after upload)
     std::unordered_map<uint32_t, uint64_t> section_file_offsets;
@@ -200,14 +201,13 @@ private:
             k.cbuf0_size = shdr(i)->sh_size;
         }
 
-        // Pass 7: parse .nv.constant2.<name> for cbuf2 size
+        // Pass 7: detect global .nv.constant3 (SM120 __constant__ data)
         for (int i = 0; i < e->e_shnum; i++) {
-            std::string sname = section_name(i);
-            if (sname.substr(0, 14) != ".nv.constant2.") continue;
-            std::string kname = sname.substr(14);
-            auto it = kernel_by_mangled.find(kname);
-            if (it == kernel_by_mangled.end()) continue;
-            kernels[it->second].cbuf2_size = shdr(i)->sh_size;
+            if (section_name(i) == ".nv.constant3") {
+                cbuf3_offset = shdr(i)->sh_offset;
+                cbuf3_size = shdr(i)->sh_size;
+                break;
+            }
         }
 
         // Pass 8: collect relocations

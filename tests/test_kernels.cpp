@@ -1067,21 +1067,21 @@ static TestSetup setup_fft512_mel_log(GPU& gpu, CubinLoader& cubin, uint64_t bas
     // Allocate GPU buffers
     auto bframes = gpu.gpu_malloc(n_frames * 512 * sizeof(float));
     auto bmel = gpu.gpu_malloc(out_sz * sizeof(float));
-    uint32_t cbuf2_sz = k->cbuf2_size;
-    if (cbuf2_sz < n_mel_entries * (uint32_t)sizeof(MelFBEntry))
-        cbuf2_sz = n_mel_entries * sizeof(MelFBEntry);
-    auto bcbuf2 = gpu.gpu_malloc(cbuf2_sz);
+    uint32_t cbuf3_sz = cubin.cbuf3_size;
+    if (cbuf3_sz < n_mel_entries * (uint32_t)sizeof(MelFBEntry))
+        cbuf3_sz = n_mel_entries * sizeof(MelFBEntry);
+    auto bcbuf3 = gpu.gpu_malloc(cbuf3_sz);
 
     auto* frames = (float*)bframes.cpu_ptr;
     auto* mel_out = (float*)bmel.cpu_ptr;
-    auto* mel_fb = (MelFBEntry*)bcbuf2.cpu_ptr;
+    auto* mel_fb = (MelFBEntry*)bcbuf3.cpu_ptr;
 
     // Fill input frames with small random values
     fill_fp32(frames, n_frames * 512, -0.5f, 0.5f);
     memset(mel_out, 0, out_sz * sizeof(float));
 
     // Generate deterministic mel filterbank entries
-    memset(mel_fb, 0, cbuf2_sz);
+    memset(mel_fb, 0, cbuf3_sz);
     for (int i = 0; i < n_mel_entries; i++) {
         mel_fb[i].freq = (uint16_t)((i * 257) / n_mel_entries);
         mel_fb[i].mel = (uint16_t)((i * 128) / n_mel_entries);
@@ -1094,7 +1094,7 @@ static TestSetup setup_fft512_mel_log(GPU& gpu, CubinLoader& cubin, uint64_t bas
         {bframes.gpu_addr, bmel.gpu_addr, n_frames};
     launch_only(gpu, k, base, &args, sizeof(args),
                 n_frames, 1, 1, 256, 1, 1,
-                bcbuf2.gpu_addr, cbuf2_sz);
+                bcbuf3.gpu_addr, cbuf3_sz);
 
     return {"fft512_mel_log_kernel", out_sz,
         [frames, mel_out, mel_fb, n_frames, n_mel_entries, out_sz]() {
