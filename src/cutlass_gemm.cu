@@ -462,3 +462,36 @@ void cutlass_batched_gemm_nt_ex(cudaStream_t stream,
             B, ldB, strideB, A, ldA, strideA, C, ldC, strideC,
             batch, HALF_ONE, HALF_ZERO, stream);
 }
+
+// =========================================================================
+// gemm.h unified interface — forward to cutlass_* functions
+// =========================================================================
+
+#include "gemm.h"
+
+void gemm_init(cudaStream_t stream)   { cutlass_gemm_init(stream); }
+void gemm_free()                      { cutlass_gemm_free(); }
+
+void gemm_nn(cudaStream_t s, const half* X, int m, int k, const half* W, int n, half* Y)
+    { cutlass_gemm_nn(s, X, m, k, W, n, Y); }
+void gemm_nn_bias(cudaStream_t s, const half* X, int m, int k, const half* W, int n, const half* bias, half* Y)
+    { cutlass_gemm_nn_bias(s, X, m, k, W, n, bias, Y); }
+void gemm_nt(cudaStream_t s, const half* X, int m, int k, const half* W, int n, half* Y)
+    { cutlass_gemm_nt(s, X, m, k, W, n, Y); }
+void gemm_nt_bias(cudaStream_t s, const half* X, int m, int k, const half* W, int n, const half* bias, half* Y)
+    { cutlass_gemm_nt_bias(s, X, m, k, W, n, bias, Y); }
+
+void batched_gemm_nn(cudaStream_t s, const half* A, const half* B, half* C,
+                     int batch, int m, int n, int k,
+                     long long sA, long long sB, long long sC)
+    { cutlass_batched_gemm_nn(s, A, B, C, batch, m, n, k, sA, sB, sC); }
+void batched_gemm_nt(cudaStream_t s, const half* A, const half* B, half* C,
+                     int batch, int m, int n, int k,
+                     long long sA, long long sB, long long sC)
+    { cutlass_batched_gemm_nt(s, A, B, C, batch, m, n, k, sA, sB, sC); }
+void batched_gemm_nt_ex(cudaStream_t s,
+                        const half* A, int ldA, long long sA,
+                        const half* B, int ldB, long long sB,
+                        half* C, int ldC, long long sC,
+                        int batch, int m, int n, int k)
+    { cutlass_batched_gemm_nt_ex(s, A, ldA, sA, B, ldB, sB, C, ldC, sC, batch, m, n, k); }

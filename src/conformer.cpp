@@ -7,7 +7,7 @@
 #include "conformer.h"
 #include "common.h"
 #include "kernels.h"
-#include "cutlass_gemm.h"
+#include "gemm.h"
 
 #include <cassert>
 #include <cmath>
@@ -318,7 +318,7 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
     stream = s;
     T_max = max_mel_frames / 8 + 10;  // encoder frames after 8x downsampling
 
-    cutlass_gemm_init(stream);
+    gemm_init(stream);
 
     // --- Single pooled GPU allocation for all inference buffers ---
     // Replaces ~35 individual cudaMalloc calls with one.
@@ -492,30 +492,12 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
 // ---------------------------------------------------------------------------
 
 void CudaModel::free() {
-    cutlass_gemm_free();
+    gemm_free();
     // All inference buffers are carved from a single pooled allocation
     if (gpu_pool) { cudaFree(gpu_pool); gpu_pool = nullptr; }
 }
 
-// GEMM wrappers — thin forwarders to cutlass_gemm.h functions.
-// These exist so the encoder/decoder code doesn't need to change its call patterns.
-
-static void gemm_nn(cudaStream_t stream, const half* X, int m, int k,
-                     const half* W, int n, half* Y) {
-    cutlass_gemm_nn(stream, X, m, k, W, n, Y);
-}
-static void gemm_nn_bias(cudaStream_t stream, const half* X, int m, int k,
-                          const half* W, int n, const half* bias, half* Y) {
-    cutlass_gemm_nn_bias(stream, X, m, k, W, n, bias, Y);
-}
-static void gemm_nt(cudaStream_t stream, const half* X, int m, int k,
-                     const half* W, int n, half* Y) {
-    cutlass_gemm_nt(stream, X, m, k, W, n, Y);
-}
-static void gemm_nt_bias(cudaStream_t stream, const half* X, int m, int k,
-                           const half* W, int n, const half* bias, half* Y) {
-    cutlass_gemm_nt_bias(stream, X, m, k, W, n, bias, Y);
-}
+// GEMM calls use gemm.h interface directly — backend selected at link time.
 
 // Position encoding generation moved to GPU kernel (generate_pos_encoding_gpu)
 
@@ -629,7 +611,7 @@ int CudaModel::encode_gpu(int T_mel) {
             // Position scores via strided batched GEMM
             // Row-major NT: pos_scores[h,T,pos_len] = q_v[h,T,HEAD_DIM] @ pos[h,pos_len,HEAD_DIM]^T
             // pos_temp has non-standard ld=D_MODEL (interleaved heads), stride=HEAD_DIM between heads
-            cutlass_batched_gemm_nt_ex(stream,
+            batched_gemm_nt_ex(stream,
                 q_v_buf, HEAD_DIM, (long long)T * HEAD_DIM,        // A: [T, HEAD_DIM] per head
                 pos_temp, D_MODEL, (long long)HEAD_DIM,            // B: [pos_len, HEAD_DIM] ld=D_MODEL
                 pos_scores, pos_len, (long long)T * pos_len,       // C: [T, pos_len] per head
@@ -638,14 +620,14 @@ int CudaModel::encode_gpu(int T_mel) {
             float scale = 1.0f / sqrtf((float)HEAD_DIM);
 
             // Content attention scores: [8, T, T] = q_u @ K^T
-            cutlass_batched_gemm_nt(stream, q_u, K_h, scores,
+            batched_gemm_nt(stream, q_u, K_h, scores,
                             N_HEADS, T, T, HEAD_DIM,
                             (long long)T * HEAD_DIM, (long long)T * HEAD_DIM, (long long)T * T);
             // Fused: (content + pos_skew) * scale + softmax
             fused_score_softmax_fp16(scores, pos_scores, scores,
                                       N_HEADS, T, scale, stream);
             // Weighted sum: [8, T, 128] = scores @ V
-            cutlass_batched_gemm_nn(stream, scores, V_h, attn_out,
+            batched_gemm_nn(stream, scores, V_h, attn_out,
                             N_HEADS, T, HEAD_DIM, T,
                             (long long)T * T, (long long)T * HEAD_DIM, (long long)T * HEAD_DIM);
             // Transpose [8, T, 128] → [T, 8, 128] = [T, 1024]

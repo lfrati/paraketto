@@ -173,7 +173,7 @@ struct Weights {
 };
 
 // ---------------------------------------------------------------------------
-// CudaModel — encoder + decoder forward pass using cuBLAS + custom kernels
+// CudaModel — encoder + decoder forward pass using GEMM backend + custom kernels
 // ---------------------------------------------------------------------------
 
 // Model constants

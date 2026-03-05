@@ -11,7 +11,7 @@ CXXFLAGS = -std=c++17 -O3 -march=native -flto=auto -Wno-deprecated-declarations 
 NVFLAGS  = -std=c++17 -O3 -I$(CUDA_HOME)/include -Isrc --expt-relaxed-constexpr
 LDFLAGS  = -flto=auto -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lpthread $(TRT_LIBS)/libnvinfer.so.10 -Wl,-rpath,$(TRT_LIBS)
 
-.PHONY: bench-all bench-py bench-cpp bench-cuda engines inspect-onnx weights download-data download-weights clean
+.PHONY: bench-all bench-py bench-cpp bench-cuda bench-cublas engines inspect-onnx weights download-data download-weights clean
 
 # Download benchmark data from GitHub release
 data/librispeech/manifest.json:
@@ -43,7 +43,7 @@ bench-all: paraketto engines/encoder.engine engines/decoder_joint.engine paraket
 	@uv run python tests/bench.py
 	$(call BENCH_SEP,C++ TRT ·  paraketto.cpp + TensorRT)
 	@uv run python tests/bench_cpp.py
-	$(call BENCH_SEP,C++ CUDA · paraketto_cuda.cpp + cuBLAS)
+	$(call BENCH_SEP,C++ CUDA · paraketto_cuda.cpp + CUTLASS)
 	@uv run python tests/bench_cuda.py
 
 bench-py: data/librispeech/manifest.json
@@ -53,7 +53,10 @@ bench-cpp: paraketto engines/encoder.engine engines/decoder_joint.engine data/li
 	uv run python tests/bench_cpp.py
 
 bench-cuda: paraketto.cuda data/librispeech/manifest.json weights.bin
-	uv run python tests/bench_cuda.py
+	uv run python tests/bench_cuda.py paraketto.cuda
+
+bench-cublas: paraketto.cublas data/librispeech/manifest.json weights.bin
+	uv run python tests/bench_cuda.py paraketto.cublas
 
 # ONNX inspection and weight export
 inspect-onnx:
@@ -75,16 +78,25 @@ SHARED_HEADERS = src/common.h src/wav.h src/mel.h src/vocab.h src/server.h
 paraketto: src/paraketto.cpp src/kernels.o src/kernels.h $(SHARED_HEADERS)
 	$(CXX) $(CXXFLAGS) src/paraketto.cpp src/kernels.o $(LDFLAGS) -o $@
 
-# CUDA backend (CUTLASS GEMM, no cuBLAS/TensorRT dependency)
+# Shared CUDA backend flags
 CUDA_CXXFLAGS = -std=c++17 -O3 -march=native -flto=auto -Wno-deprecated-declarations -I$(CUDA_HOME)/include -Ithird_party -Isrc
 CUDA_LDFLAGS  = -flto=auto -L$(CUDA_HOME)/lib64 -lcudart -lpthread
 CUTLASS_INC   = -Ithird_party/cutlass/include -Ithird_party/cutlass/tools/util/include
+CONFORMER_DEPS = src/paraketto_cuda.cpp src/conformer.cpp src/conformer.h src/kernels.h src/gemm.h $(SHARED_HEADERS)
 
-src/cutlass_gemm.o: src/cutlass_gemm.cu src/cutlass_gemm.h src/kernels.h
+# CUTLASS GEMM backend (default — no cuBLAS dependency, cudart only)
+src/cutlass_gemm.o: src/cutlass_gemm.cu src/cutlass_gemm.h src/gemm.h src/kernels.h
 	$(NVCC) $(NVFLAGS) -arch=sm_80 $(CUTLASS_INC) -c $< -o $@
 
-paraketto.cuda: src/paraketto_cuda.cpp src/conformer.cpp src/conformer.h src/kernels.o src/cutlass_gemm.o src/kernels.h src/cutlass_gemm.h $(SHARED_HEADERS)
+paraketto.cuda: $(CONFORMER_DEPS) src/kernels.o src/cutlass_gemm.o src/cutlass_gemm.h
 	$(CXX) $(CUDA_CXXFLAGS) src/paraketto_cuda.cpp src/conformer.cpp src/kernels.o src/cutlass_gemm.o $(CUDA_LDFLAGS) -o $@
 
+# cuBLAS GEMM backend (faster on some shapes, requires libcublas)
+src/cublas_gemm.o: src/cublas_gemm.cu src/gemm.h src/kernels.h
+	$(NVCC) $(NVFLAGS) -c $< -o $@
+
+paraketto.cublas: $(CONFORMER_DEPS) src/kernels.o src/cublas_gemm.o
+	$(CXX) $(CUDA_CXXFLAGS) src/paraketto_cuda.cpp src/conformer.cpp src/kernels.o src/cublas_gemm.o $(CUDA_LDFLAGS) -lcublas -lcublasLt -o $@
+
 clean:
-	rm -f paraketto paraketto.cuda src/kernels.o src/cutlass_gemm.o
+	rm -f paraketto paraketto.cuda paraketto.cublas src/kernels.o src/cutlass_gemm.o src/cublas_gemm.o
