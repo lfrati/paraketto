@@ -803,14 +803,11 @@ public:
     // CUBIN upload — upload entire ELF image to GPU memory
     // =========================================================================
 
-    GpuAlloc cubin_gpu = {};
-
     uint64_t upload_cubin(const uint8_t* image, size_t size) {
-        if (cubin_gpu.cpu_ptr) return cubin_gpu.gpu_addr;
-        cubin_gpu = gpu_malloc(size);
-        memcpy(cubin_gpu.cpu_ptr, image, size);
+        GpuAlloc alloc = gpu_malloc(size);
+        memcpy(alloc.cpu_ptr, image, size);
         __sync_synchronize();
-        return cubin_gpu.gpu_addr;
+        return alloc.gpu_addr;
     }
 
     // =========================================================================
@@ -848,6 +845,7 @@ public:
         first_dispatch = true;
         last_qmd_cpu = nullptr;
         last_qmd_gpu = 0;
+        launch_count = 0;
 
         if (!channel_setup_done) {
             nvm(1, 0x0000, 1); nvm_data(0xCEC0);  // SET_OBJECT subchannel 1 = COMPUTE
@@ -881,19 +879,17 @@ public:
         memset(&qmd, 0, sizeof(qmd));
 
         qmd.dw[4] = 0x013f0000;   // qmd_type=GRID_CTA, group_id=0x3F
-        qmd.dw[9] = 0x00000000;   // QMD release disabled
-        qmd.dw[10] = 0x00000000;  // dependent_qmd0 fields — set by chaining code, not template
-        qmd.dw[12] = 0x00000000;  // dependent_qmd0 pointer — set by chaining code, not template
-        qmd.dw[14] = 0x2f5003a4;  // sass_version=0xa4, sampler_index=1, major=5
-        qmd.dw[19] = 0x80610000;  // cwd_membar_type=1
-        qmd.dw[20] = 0x00000008;
-        qmd.dw[22] = 0x04000000;
-        qmd.dw[58] = 0x00000011;  // cbuf0+cbuf1 valid
+        qmd.dw[14] = 0x0f5003a4;  // sass_version=0xa4, sampler_index=1, api_visible_call_limit=1,
+                                   // invalidate tex hdr/sampler/data + shader data, qmd_major=5
+        qmd.dw[19] = 0x00010000;  // cwd_membar_type=L1_SYSMEMBAR(1)
+        qmd.dw[58] = 0x00000019;  // cbuf0 valid + invalidate, cbuf1 valid
 
-        // Program address
+        // Program address + prefetch size
         uint64_t prog_s4 = code_gpu_addr >> 4;
+        uint32_t prefetch_sz = code_size >> 8;
+        if (prefetch_sz > 0x1FF) prefetch_sz = 0x1FF;
         qmd.dw[32] = (uint32_t)(prog_s4 & 0xFFFFFFFF);
-        qmd.dw[33] = (uint32_t)(prog_s4 >> 32) & 0x1FFFFF;
+        qmd.dw[33] = ((uint32_t)(prog_s4 >> 32) & 0x1FFFFF) | (prefetch_sz << 21);
 
         // Block dimensions + register count + barrier
         qmd.dw[34] = (block_y << 16) | block_x;
@@ -961,7 +957,10 @@ public:
 
         last_qmd_cpu = (uint32_t*)qmd_mem.cpu_ptr;
         last_qmd_gpu = qmd_mem.gpu_addr;
+        launch_count++;
     }
+
+    int launch_count = 0;
 
     void wait_kernel() {
         if (!pb_started) return;
@@ -999,9 +998,9 @@ public:
         int spins = 0;
         while (*sem64 < sem_counter) {
             __sync_synchronize();
-            if (++spins > 100000000) {
-                fprintf(stderr, "wait_kernel: timeout! sem64=0x%lx expected>=0x%lx\n",
-                        (unsigned long)*sem64, (unsigned long)sem_counter);
+            if (++spins > 10000000) {
+                fprintf(stderr, "wait_kernel: timeout! sem64=0x%lx expected>=0x%lx (batch=%d kernels)\n",
+                        (unsigned long)*sem64, (unsigned long)sem_counter, launch_count);
                 break;
             }
         }

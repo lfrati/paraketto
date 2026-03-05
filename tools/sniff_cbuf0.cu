@@ -15,7 +15,13 @@
 #include <cstring>
 #include <cstdlib>
 #include <vector>
+#include <signal.h>
+#include <setjmp.h>
 #include <cuda_fp16.h>
+
+static sigjmp_buf jmp_env;
+static volatile sig_atomic_t got_signal = 0;
+static void bus_handler(int sig) { got_signal = 1; siglongjmp(jmp_env, 1); }
 
 __global__ void add_relu_kernel(const half* a, const half* b, half* y, int n) {
     int i = blockDim.x * blockIdx.x + threadIdx.x;
@@ -190,6 +196,13 @@ int main() {
     // and 0xfffdc0 at DWORD 223
     fprintf(stderr, "\n=== Scanning for cbuf0 content (shared_window=0x729400000000) ===\n");
 
+    // Install SIGBUS/SIGSEGV handler to skip unmappable GPU memory regions
+    struct sigaction sa = {}, old_bus = {}, old_segv = {};
+    sa.sa_handler = bus_handler;
+    sa.sa_flags = 0;
+    sigaction(SIGBUS, &sa, &old_bus);
+    sigaction(SIGSEGV, &sa, &old_segv);
+
     for (auto& m : matches) {
         fprintf(stderr, "\nSearching for cbuf0 gpu_va=0x%lx (size=%u)...\n",
                 (unsigned long)m.cbuf0_gpu_va, m.cbuf0_size);
@@ -198,9 +211,17 @@ int main() {
             if (!r.readable) continue;
             size_t size = r.end - r.start;
             if (size < 924) continue;
-            if (size > 64 * 1024 * 1024) continue;  // smaller limit to avoid bus errors
-            // Skip kernel/device regions that might bus error
+            if (size > 64 * 1024 * 1024) continue;
             if (r.start < 0x10000) continue;
+
+            // Test if region is actually readable
+            got_signal = 0;
+            if (sigsetjmp(jmp_env, 1) != 0) {
+                // Got SIGBUS/SIGSEGV, skip this region
+                continue;
+            }
+            volatile uint32_t test_read = *(volatile uint32_t*)r.start;
+            (void)test_read;
 
             const uint32_t* base = (const uint32_t*)r.start;
             size_t n_dwords = size / 4;
@@ -280,6 +301,9 @@ int main() {
     }
     fprintf(stderr, "\nCould not find cbuf0 in mapped memory!\n");
 found:
+    // Restore signal handlers
+    sigaction(SIGBUS, &old_bus, nullptr);
+    sigaction(SIGSEGV, &old_segv, nullptr);
 
     cudaFree(d_a); cudaFree(d_b); cudaFree(d_y);
     delete[] h_a;

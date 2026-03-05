@@ -113,10 +113,10 @@ test_cudaless: tests/test_cudaless.cpp src/gpu.h src/cubin_loader.h src/kernels.
 
 # CUTLASS cubin + params bridge
 cutlass_gemm.cubin: src/cutlass_gemm.cu src/cutlass_gemm.h
-	$(NVCC) -std=c++17 -O3 --cubin -arch=sm_120 -I$(CUDA_HOME)/include -Isrc $(CUTLASS_INC) $< -o $@
+	$(NVCC) -std=c++17 -O3 --cubin -arch=sm_120 --expt-relaxed-constexpr -I$(CUDA_HOME)/include -Isrc $(CUTLASS_INC) $< -o $@
 
 src/cutlass_params.o: src/cutlass_params.cu
-	$(NVCC) -std=c++17 -O3 -arch=sm_80 --expt-relaxed-constexpr $(CUTLASS_INC) -I$(CUDA_HOME)/include -Isrc -c $< -o $@
+	$(NVCC) -std=c++17 -O3 -arch=sm_120 --expt-relaxed-constexpr $(CUTLASS_INC) -I$(CUDA_HOME)/include -Isrc -c $< -o $@
 
 # CUDA runtime stubs (avoids linking libcudart for nvcc-compiled objects)
 src/cuda_stubs.o: src/cuda_stubs.cpp
@@ -126,5 +126,13 @@ src/cuda_stubs.o: src/cuda_stubs.cpp
 test_cutlass_cudaless: tests/test_cutlass_cudaless.cpp src/cutlass_cudaless.h src/gpu.h src/cubin_loader.h src/cutlass_params.o src/cuda_stubs.o cutlass_gemm.cubin
 	$(CXX) $(CUDALESS_CXXFLAGS) tests/test_cutlass_cudaless.cpp src/cutlass_params.o src/cuda_stubs.o -o $@ -lm
 
+# Cudaless full inference binary (zero libcuda/libcudart dependency)
+paraketto.cudaless: src/paraketto_cudaless.cpp src/cudaless_model.h \
+                    src/gpu.h src/cubin_loader.h src/cutlass_cudaless.h \
+                    src/cutlass_params.o src/cuda_stubs.o \
+                    $(SHARED_HEADERS) kernels.cubin cutlass_gemm.cubin
+	$(CXX) $(CUDALESS_CXXFLAGS) -Ithird_party src/paraketto_cudaless.cpp \
+	    src/cutlass_params.o src/cuda_stubs.o -o $@ -lm -lpthread
+
 clean:
-	rm -f paraketto paraketto.cuda src/kernels.o src/cutlass_gemm.o src/cutlass_params.o src/cuda_stubs.o gpu_test kernels.cubin cutlass_gemm.cubin test_cudaless test_kernels test_cutlass_cudaless
+	rm -f paraketto paraketto.cuda paraketto.cudaless src/kernels.o src/cutlass_gemm.o src/cutlass_params.o src/cuda_stubs.o gpu_test kernels.cubin cutlass_gemm.cubin test_cudaless test_kernels test_cutlass_cudaless

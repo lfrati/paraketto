@@ -119,7 +119,107 @@ static bool compare_fp16(const uint16_t* gpu, const uint16_t* cpu, int count,
 // =========================================================================
 
 static bool test_gemm_nn(CutlassCudaless& cl) {
-    const int M = 64, N = 128, K = 64;
+    const int M = 64, N = 64, K = 64;
+
+    // Diagnostic 1: zero-input test
+    {
+        auto a0 = cl.gpu->gpu_malloc(M * K * 2);
+        auto b0 = cl.gpu->gpu_malloc(K * N * 2);
+        auto c0 = cl.gpu->gpu_malloc(M * N * 2);
+        memset(a0.cpu_ptr, 0, M * K * 2);
+        memset(b0.cpu_ptr, 0, K * N * 2);
+        for (int i = 0; i < M * N; i++) ((uint16_t*)c0.cpu_ptr)[i] = 0x3C00;
+        __sync_synchronize();
+        cl.gpu->begin_commands();
+        cl.gemm_nn(a0.gpu_addr, M, K, b0.gpu_addr, N, c0.gpu_addr);
+        cl.gpu->wait_kernel();
+        __sync_synchronize();
+        uint16_t* out = (uint16_t*)c0.cpu_ptr;
+        int nonzero = 0;
+        for (int i = 0; i < M * N; i++) if (out[i] != 0) nonzero++;
+        printf("  [diag] zero-input test: %d/%d non-zero outputs (should be 0)\n", nonzero, M*N);
+    }
+
+    // Diagnostic 2: identity matrix test (A=I, B=sequential => C should = B)
+    {
+        auto ai = cl.gpu->gpu_malloc(M * K * 2);
+        auto bi = cl.gpu->gpu_malloc(K * N * 2);
+        auto ci = cl.gpu->gpu_malloc(M * N * 2);
+        uint16_t* hA = (uint16_t*)ai.cpu_ptr;
+        uint16_t* hB = (uint16_t*)bi.cpu_ptr;
+        uint16_t* hC = (uint16_t*)ci.cpu_ptr;
+        memset(hA, 0, M * K * 2);
+        for (int i = 0; i < M && i < K; i++) hA[i * K + i] = fp32_to_fp16(1.0f);
+        // B = sequential: B[i,j] = (i*N + j + 1) * 0.01
+        for (int i = 0; i < K; i++)
+            for (int j = 0; j < N; j++)
+                hB[i * N + j] = fp32_to_fp16((float)(i * N + j + 1) * 0.01f);
+        memset(hC, 0, M * N * 2);
+        __sync_synchronize();
+        cl.gpu->begin_commands();
+        cl.gemm_nn(ai.gpu_addr, M, K, bi.gpu_addr, N, ci.gpu_addr);
+        cl.gpu->wait_kernel();
+        __sync_synchronize();
+        // Expected: C = I @ B = B
+        printf("  [diag] identity test C=I@B (should equal B):\n");
+        int id_err = 0;
+        for (int i = 0; i < M; i++)
+            for (int j = 0; j < N; j++) {
+                float gpu = fp16_to_fp32(hC[i * N + j]);
+                float exp = fp16_to_fp32(hB[i * N + j]);
+                if (fabsf(gpu - exp) > 0.01f) {
+                    if (id_err < 10)
+                        printf("    C[%d,%d] gpu=%.6f expected=%.6f\n", i, j, gpu, exp);
+                    id_err++;
+                }
+            }
+        if (id_err == 0)
+            printf("    PASS: C == B (identity works with non-uniform data!)\n");
+        else {
+            printf("    FAIL: %d/%d mismatches\n", id_err, M*N);
+            // Show first row of GPU output vs expected
+            printf("    GPU row 0:");
+            for (int j = 0; j < 8; j++) printf(" %.4f", fp16_to_fp32(hC[j]));
+            printf("\n    Exp row 0:");
+            for (int j = 0; j < 8; j++) printf(" %.4f", fp16_to_fp32(hB[j]));
+            printf("\n");
+            // Check if GPU output = B^T (transposed)
+            int t_err = 0;
+            for (int i = 0; i < M; i++)
+                for (int j = 0; j < N; j++) {
+                    float gpu = fp16_to_fp32(hC[i * N + j]);
+                    float bt = fp16_to_fp32(hB[j * N + i]);  // B^T
+                    if (fabsf(gpu - bt) > 0.01f) t_err++;
+                }
+            printf("    Transposed check: %d/%d mismatches (0 = output is B^T)\n", t_err, M*N);
+        }
+    }
+
+    // Diagnostic 3: all-ones test (each element=1.0, result should be K=64.0)
+    {
+        auto a1 = cl.gpu->gpu_malloc(M * K * 2);
+        auto b1 = cl.gpu->gpu_malloc(K * N * 2);
+        auto c1 = cl.gpu->gpu_malloc(M * N * 2);
+        for (int i = 0; i < M * K; i++) ((uint16_t*)a1.cpu_ptr)[i] = 0x3C00; // 1.0
+        for (int i = 0; i < K * N; i++) ((uint16_t*)b1.cpu_ptr)[i] = 0x3C00; // 1.0
+        memset(c1.cpu_ptr, 0, M * N * 2);
+        __sync_synchronize();
+        printf("  [diag] ones test: A@0x%lx B@0x%lx C@0x%lx\n",
+               (unsigned long)a1.gpu_addr, (unsigned long)b1.gpu_addr, (unsigned long)c1.gpu_addr);
+        cl.gpu->begin_commands();
+        cl.gemm_nn(a1.gpu_addr, M, K, b1.gpu_addr, N, c1.gpu_addr);
+        cl.gpu->wait_kernel();
+        __sync_synchronize();
+        uint16_t* out = (uint16_t*)c1.cpu_ptr;
+        printf("  [diag] ones test first 8:");
+        for (int i = 0; i < 8; i++) printf(" %.1f", fp16_to_fp32(out[i]));
+        printf(" (expected all 64.0)\n");
+        // Check if ALL values are the same
+        int same = 0;
+        for (int i = 1; i < M * N; i++) if (out[i] == out[0]) same++;
+        printf("  [diag] ones test: %d/%d elements equal to first (%.1f)\n",
+               same+1, M*N, fp16_to_fp32(out[0]));
+    }
 
     // Allocate GPU memory
     auto alloc_A = cl.gpu->gpu_malloc(M * K * 2);
@@ -145,7 +245,48 @@ static bool test_gemm_nn(CutlassCudaless& cl) {
     cl.gpu->wait_kernel();
     __sync_synchronize();
 
-    bool ok = compare_fp16(h_C, cpu_C, M * N, 0.02f, 0.01f, "gemm_nn 64x128x64");
+    // Verify input data readback
+    {
+        uint16_t v0 = h_A[0], v1 = h_A[1], v100 = h_A[100];
+        printf("  [diag] readback A: [0]=0x%04x(%.4f) [1]=0x%04x(%.4f) [100]=0x%04x(%.4f)\n",
+               v0, fp16_to_fp32(v0), v1, fp16_to_fp32(v1), v100, fp16_to_fp32(v100));
+        // Re-generate to verify
+        uint16_t check[4096];
+        fill_random_fp16(check, M*K, 42);
+        if (memcmp(h_A, check, M*K*2) != 0) printf("  [diag] WARNING: A readback mismatch!\n");
+        else printf("  [diag] A readback matches expected data\n");
+        fill_random_fp16(check, K*N, 123);
+        if (memcmp(h_B, check, K*N*2) != 0) printf("  [diag] WARNING: B readback mismatch!\n");
+        else printf("  [diag] B readback matches expected data\n");
+    }
+
+    // Dump first 16 GPU values vs CPU
+    printf("  [diag] GPU vs CPU first 16:\n");
+    for (int i = 0; i < 16; i++)
+        printf("    [%2d] gpu=%.6f cpu=%.6f\n", i, fp16_to_fp32(h_C[i]), fp16_to_fp32(cpu_C[i]));
+
+    // Diagnostic: compute h_B @ h_A to check if matrices are swapped
+    uint16_t* swap_C = new uint16_t[M * N]();
+    cpu_gemm_nn(h_B, h_A, swap_C, N, M, K, 1.0f, 0.0f);  // B@A instead of A@B
+    printf("  [diag] Checking if GPU = B@A (swapped):\n");
+    for (int i = 0; i < 8; i++)
+        printf("    [%2d] gpu=%.6f A@B=%.6f B@A=%.6f\n", i,
+               fp16_to_fp32(h_C[i]), fp16_to_fp32(cpu_C[i]), fp16_to_fp32(swap_C[i]));
+    delete[] swap_C;
+
+    // Diagnostic: try also interpreting output as transposed
+    printf("  [diag] Checking if GPU output = (A@B)^T (col-major read):\n");
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 2; j++) {
+            int row_idx = i * N + j;
+            int col_idx = j * M + i;  // transposed index
+            printf("    C[%d,%d] gpu=%.6f cpu_row[%d,%d]=%.6f cpu_col[%d,%d]=%.6f\n",
+                   i, j, fp16_to_fp32(h_C[row_idx]),
+                   i, j, fp16_to_fp32(cpu_C[row_idx]),
+                   j, i, fp16_to_fp32(cpu_C[col_idx]));
+        }
+
+    bool ok = compare_fp16(h_C, cpu_C, M * N, 0.02f, 0.01f, "gemm_nn 64x64x64");
     delete[] cpu_C;
     return ok;
 }

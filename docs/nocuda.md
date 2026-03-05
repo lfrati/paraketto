@@ -713,13 +713,141 @@ ldd test_cutlass_cudaless
 # → linux-vdso, libstdc++, libm, libgcc_s, libc, ld-linux
 ```
 
-## 16. What's Next
+## 16. CUTLASS GEMM Debugging — Open Issue
 
-- **Full inference**: Wire up paraketto_cudaless.cpp end-to-end — all custom kernels
-  and CUTLASS GEMM launch via gpu.h, zero CUDA runtime dependencies
+### Status: PARAMS ARE WRONG (not a launch/QMD/cbuf0 issue)
+
+All 4 CUTLASS GEMM tests fail via cudaless. **But they also fail when launched
+via the CUDA driver API (`cuLaunchKernel`)** with the exact same params. This
+definitively proves the issue is in the params construction, not in QMD, cbuf0,
+or any part of the cudaless launch path.
+
+### Proof: test_cutlass_cuda.cu
+
+`tests/test_cutlass_cuda.cu` loads `cutlass_gemm.cubin` via `cuModuleLoad`,
+builds params using the same `cutlass_params_nn_64x64_64_s6()` bridge, and
+launches via `cuLaunchKernel`. Result:
+
+```
+CUDA DRIVER API: FAIL (4070/4096 errors, max_rel=2413.6792) — PARAMS ARE WRONG
+```
+
+Exact same error count and max_rel as the cudaless path. The GPU output values
+are identical between both paths. This rules out every cudaless-specific theory.
+
+### Failure pattern
+
+| Test | Result | Notes |
+|------|--------|-------|
+| Zero inputs (A=0, B=0) | PASS | Output is all zeros |
+| All-ones (A=1, B=1) | PASS | Output is all 64.0 (= K) |
+| Identity (A=I, B=sequential) | PASS | Output equals B |
+| Random × random (64×64×64) | **FAIL** | 4070/4096 wrong, max_rel=2413 |
+| Random gemm_nt (64×128×64) | **FAIL** | 8131/8192 wrong |
+| Batched NN (4×64×64×64) | **FAIL** | timeout + wrong |
+| Batched NT (4×64×64×64) | **FAIL** | timeout + all zeros |
+
+The identity test passing is **misleading** — it doesn't prove correctness
+because `I @ B = B` regardless of whether A and B are swapped, transposed,
+or read with wrong strides. Similarly, uniform inputs (zeros, ones) pass
+because wrong addressing yields the same values.
+
+### Root cause analysis: the ColumnMajor double-swap
+
+The CUTLASS `Gemm` class has a **partial specialization for ColumnMajor output**
+(`cutlass/gemm/device/gemm.h` line 572). When all three matrices are ColumnMajor
+(as in our NN types), this specialization activates and does a transparent
+swap in `to_underlying_arguments()` (line 700):
+
+```cpp
+static UnderlyingArguments to_underlying_arguments(Arguments const &args) {
+    return UnderlyingArguments(
+      {args.problem_size.n(), args.problem_size.m(), args.problem_size.k()},  // swap M,N
+      {args.ref_B.data(), args.ref_B.stride(0)},   // swap A←B
+      {args.ref_A.data(), args.ref_A.stride(0)},   // swap B←A
+      ...
+    );
+}
+```
+
+Our `cutlass_cudaless.h` already does a manual row→col swap:
+```cpp
+// gemm_nn: Row→Col conversion
+launch_gemm(..., n, m, k, W, n, X, k, Y, n, ...)  // swap M↔N, A↔B
+```
+
+So the chain is:
+1. **Our code** swaps: M=n, N=m, A=W(B_row), B=X(A_row)
+2. **CUTLASS ColumnMajor specialization** swaps back: M=m, N=n, A=X(A_row), B=W(B_row)
+3. **Underlying RowMajor kernel** computes: C = X @ W = A_row @ B_row ✓
+
+The double-swap cancels out and the math is correct. **But the params struct
+is built by the underlying RowMajor operator**, and the SM120 cubin kernel
+was compiled with the **ColumnMajor types** (which use the RowMajor underlying
+kernel). The params layout should match since `GemmKernel` is delegated through.
+
+### What we verified is NOT the problem
+
+| Theory | Status | How eliminated |
+|--------|--------|----------------|
+| QMD fields wrong | ❌ | Same failure via cuLaunchKernel (CUDA sets QMD) |
+| cbuf0[0x358] descriptor | ❌ | Same failure via cuLaunchKernel |
+| Shared memory config | ❌ | Same failure via cuLaunchKernel |
+| Memory allocation/coherence | ❌ | Input readback matches, same failure via CUDA allocs |
+| Row→col conversion math | ❌ | Verified algebraically, identity test passes |
+| params_ at wrong offset in GemmOp | ❌ | Verified: params_ is at offset 0, no vtable, no base class |
+| cudaless launch path | ❌ | **Definitively eliminated by test_cutlass_cuda.cu** |
+
+### What IS likely wrong
+
+The params are constructed using **SM80 CUTLASS types** (`cutlass::arch::Sm80`)
+but the cubin is compiled for **SM120**. The `cutlass_params.cu` bridge compiles
+with `-arch=sm_80` while `cutlass_gemm.cubin` compiles with `-arch=sm_120`.
+
+Potential mismatch: the SM80 `Params` struct layout may differ from what the
+SM120-compiled kernel expects. The SM80 types use `Sm80` arch tag, `mma.sync`
+instruction shapes, and SM80 iterator policies. When compiled to SM120 SASS,
+nvcc may:
+- Reorder struct fields for SM120 alignment
+- Use different iterator parameters
+- Compute different tiling constants
+
+**This is the #1 hypothesis to investigate next.**
+
+### Concrete next steps
+
+1. **Compile cutlass_params.cu with `-arch=sm_120`** instead of sm_80, to
+   ensure params struct layout matches the cubin. This requires either:
+   - Making it a device compilation (cubin) and extracting params differently
+   - Using `-arch=sm_120 --device-c` to get host code with SM120 types
+
+2. **Dump params from a working CUDA CUTLASS launch** using `tools/sniff_cutlass2.cu`
+   and compare byte-for-byte against our bridge output
+
+3. **Try the existing CUDA CUTLASS path** (`src/cutlass_gemm.cu` compiled with
+   `-arch=sm_80`) to verify it actually works — this uses the same SM80 types
+   but launches via `cudaLaunchKernel` which may handle the params differently
+
+### Test commands
+
+```bash
+# Build and run CUDA driver API test (proves params are wrong)
+nvcc -std=c++17 -O3 -arch=sm_120 -Isrc -Ithird_party/cutlass/include \
+  -Ithird_party/cutlass/tools/util/include --expt-relaxed-constexpr \
+  tests/test_cutlass_cuda.cu src/cutlass_params.o -lcuda -lcudart \
+  -o test_cutlass_cuda && ./test_cutlass_cuda
+
+# Build and run cudaless test
+make test_cutlass_cudaless && ./test_cutlass_cudaless
+```
+
+## 17. What's Next
+
+- **Fix CUTLASS params** — investigate SM80 vs SM120 params layout mismatch
+- **Full inference**: Wire up paraketto_cudaless.cpp end-to-end
 - **Performance**: Measure RTFx, compare against CUDA path
 
-## 17. Key Numbers
+## 18. Key Numbers
 
 | Metric | Value |
 |--------|-------|

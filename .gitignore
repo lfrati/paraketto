@@ -31,6 +31,7 @@ Thumbs.db
 # C++ build artifacts
 paraketto
 paraketto.cuda
+paraketto.cudaless
 paraketto.fp8
 *.o
 

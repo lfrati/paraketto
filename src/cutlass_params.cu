@@ -172,25 +172,24 @@ static int build_gemm_params_impl(void* out_params, int out_size,
     );
 
     GemmOp op;
+    memset(&op, 0, sizeof(op));
     auto status = op.initialize(args, nullptr, nullptr);
     if (status != cutlass::Status::kSuccess) return -1;
 
-    // Copy params bytes (params_ is first member of GemmOp)
+    // Copy params bytes
     using Params = typename GemmOp::GemmKernel::Params;
     int params_size = sizeof(Params);
     if (params_size > out_size) return -1;
     memcpy(out_params, &op, params_size);
 
-    // Grid: use ThreadblockSwizzle to compute tiled shape → grid
-    typename GemmOp::ThreadblockSwizzle swizzle;
-    auto tiled = swizzle.get_tiled_shape(
-        args.problem_size,
-        {GemmOp::ThreadblockShape::kM, GemmOp::ThreadblockShape::kN, GemmOp::ThreadblockShape::kK},
-        1);
-    dim3 grid = swizzle.get_grid_shape(tiled);
-    out_grid[0] = grid.x;
-    out_grid[1] = grid.y;
-    out_grid[2] = grid.z;
+    // Extract grid from the internal Params struct (grid_tiled_shape at offset 12-23)
+    // CUTLASS initialize() may rearrange problem dimensions internally, so the
+    // internal grid_tiled_shape can differ from a naive external computation.
+    // The kernel expects the QMD grid to match its internal grid_tiled_shape.
+    const int32_t* params_words = (const int32_t*)out_params;
+    out_grid[0] = params_words[3];  // grid_tiled_shape.m
+    out_grid[1] = params_words[4];  // grid_tiled_shape.n
+    out_grid[2] = params_words[5];  // grid_tiled_shape.k (split_k, usually 1)
 
     using KernelType = typename GemmOp::GemmKernel;
     out_block[0] = KernelType::kThreadCount;
@@ -228,6 +227,7 @@ static int build_batched_params_impl(void* out_params, int out_size,
     );
 
     BatchedGemmOp op;
+    memset(&op, 0, sizeof(op));
     auto status = op.initialize(args, nullptr, nullptr);
     if (status != cutlass::Status::kSuccess) return -1;
 
@@ -236,17 +236,11 @@ static int build_batched_params_impl(void* out_params, int out_size,
     if (params_size > out_size) return -1;
     memcpy(out_params, &op, params_size);
 
-    // Grid: use ThreadblockSwizzle to compute tiled shape → grid
-    typename BatchedGemmOp::ThreadblockSwizzle swizzle;
-    auto tiled = swizzle.get_tiled_shape(
-        args.problem_size,
-        {BatchedGemmOp::ThreadblockShape::kM, BatchedGemmOp::ThreadblockShape::kN,
-         BatchedGemmOp::ThreadblockShape::kK},
-        batch);
-    dim3 grid = swizzle.get_grid_shape(tiled);
-    out_grid[0] = grid.x;
-    out_grid[1] = grid.y;
-    out_grid[2] = grid.z;
+    // Extract grid from internal Params (grid_tiled_shape at offset 12-23)
+    const int32_t* params_words = (const int32_t*)out_params;
+    out_grid[0] = params_words[3];  // grid_tiled_shape.m
+    out_grid[1] = params_words[4];  // grid_tiled_shape.n
+    out_grid[2] = params_words[5];  // grid_tiled_shape.k (= batch for GemmBatched)
 
     using KernelType = typename BatchedGemmOp::GemmKernel;
     out_block[0] = KernelType::kThreadCount;
