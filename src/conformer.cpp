@@ -374,17 +374,49 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
 
     gemm_init(stream);
 
-    // --- Single pooled GPU allocation for all inference buffers ---
-    // Replaces ~35 individual cudaMalloc calls with one.
-    int max_sub = SUB_CHANNELS * (max_mel_frames / 2 + 1) * 65;
-    size_t mel_fp32_elems = 128 * max_mel_frames;  // stored as float, not half
+    // --- Pooled GPU allocation with phase-based buffer aliasing ---
+    //
+    // Subsampling buffers (sub_buf, mel_fp16) are only used at the start of
+    // encode_gpu(). Conformer buffers (scores, ff_mid, etc.) are only used
+    // in the subsequent conformer loop. Since their lifetimes don't overlap,
+    // they share the same GPU memory region ("aliased region").
+    //
+    // Layout: [aliased region | persistent region]
+    //   aliased  = max(subsampling_phase, conformer_phase)
+    //   persistent = x, pos_enc, decoder/LSTM buffers, QKV weights, mel_fp32
 
-    // Compute sizes (in half elements) and assign pointers from pool
-    size_t sizes[] = {
-        (size_t)max_sub,                        // sub_buf[0]
-        (size_t)max_sub,                        // sub_buf[1]
+    // Compute intermediate spatial dims for subsampling conv chain
+    // conv.0: stride-2 on (max_mel_frames, 128) → (H2, W2)
+    // conv.2: stride-2 on (H2, W2) → (H3, W3)
+    // sub_buf[1] peak is conv.0 output [256, H2, W2]
+    // sub_buf[0] peak is conv.2 output [256, H3, W3]
+    int H2 = (max_mel_frames + 2 - 3) / 2 + 1;
+    int W2 = (128             + 2 - 3) / 2 + 1;  // 64
+    int H3 = (H2              + 2 - 3) / 2 + 1;
+    int W3 = (W2              + 2 - 3) / 2 + 1;  // 32
+
+    size_t mel_fp32_elems = 128 * max_mel_frames;
+    constexpr size_t ALIGN = 256;
+
+    // Compute aligned total bytes for an array of half-element counts
+    auto region_bytes = [](const size_t* sizes, int n) -> size_t {
+        size_t off = 0;
+        for (int i = 0; i < n; i++) {
+            off = (off + 255) & ~(size_t)255;
+            off += sizes[i] * sizeof(half);
+        }
+        return (off + 255) & ~(size_t)255;
+    };
+
+    // Subsampling-only buffers (dead after subsampling completes)
+    size_t sub_sizes[] = {
+        (size_t)(SUB_CHANNELS * H3 * W3),       // sub_buf[0]: peak at conv.2 output
+        (size_t)(SUB_CHANNELS * H2 * W2),       // sub_buf[1]: peak at conv.0 output
         (size_t)(128 * max_mel_frames),         // mel_fp16
-        (size_t)(T_max * D_MODEL),              // x
+    };
+
+    // Conformer-only buffers (unused during subsampling)
+    size_t conf_sizes[] = {
         (size_t)(T_max * D_MODEL),              // ln_out
         (size_t)(T_max * D_FF),                 // ff_mid
         (size_t)(T_max * D_MODEL),              // ff_out
@@ -392,7 +424,6 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
         (size_t)(N_HEADS * T_max * HEAD_DIM),   // q
         (size_t)(N_HEADS * T_max * HEAD_DIM),   // k
         (size_t)(N_HEADS * T_max * HEAD_DIM),   // v
-        (size_t)((2 * T_max) * D_MODEL),        // pos_enc
         (size_t)((2 * T_max) * D_MODEL),        // pos_proj
         (size_t)(N_HEADS * T_max * HEAD_DIM),   // q_u
         (size_t)(N_HEADS * T_max * HEAD_DIM),   // q_v_buf
@@ -403,92 +434,112 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
         (size_t)(T_max * D_CONV_PW),            // conv_mid
         (size_t)(T_max * D_MODEL),              // conv_glu
         (size_t)(T_max * D_MODEL),              // conv_dw
-        (size_t)(2 * D_PRED),                   // lstm_input (concat buffer)
+    };
+
+    // Persistent buffers (span both phases or used in decoder)
+    size_t persist_sizes[] = {
+        (size_t)(T_max * D_MODEL),              // x
+        (size_t)((2 * T_max) * D_MODEL),        // pos_enc
+        (size_t)(2 * D_PRED),                   // lstm_input
         (size_t)(4 * D_PRED),                   // lstm_gates
         (size_t)D_PRED, (size_t)D_PRED,         // lstm_h[0], lstm_h[1]
         (size_t)D_PRED, (size_t)D_PRED,         // lstm_c[0], lstm_c[1]
         (size_t)D_PRED, (size_t)D_PRED,         // lstm_h_out[0], lstm_h_out[1]
         (size_t)D_PRED, (size_t)D_PRED,         // lstm_c_out[0], lstm_c_out[1]
-        (size_t)(T_max * D_JOINT),              // enc_proj_all (precomputed)
+        (size_t)(T_max * D_JOINT),              // enc_proj_all
         (size_t)D_JOINT, (size_t)D_JOINT,       // dec_proj_buf, joint_act
         (size_t)D_OUTPUT,                       // joint_out
-        // Pre-combined LSTM weights
         (size_t)(4 * D_PRED * 2 * D_PRED),     // lstm_combined_w[0]
         (size_t)(4 * D_PRED * 2 * D_PRED),     // lstm_combined_w[1]
         (size_t)(4 * D_PRED),                   // lstm_combined_bias[0]
         (size_t)(4 * D_PRED),                   // lstm_combined_bias[1]
     };
-    constexpr int N_BUFS = sizeof(sizes) / sizeof(sizes[0]);
 
-    // mel_fp32 is float not half — allocate separately; everything else is half.
-    size_t total_half = 0;
-    for (int i = 0; i < N_BUFS; i++) total_half += sizes[i];
+    size_t sub_bytes  = region_bytes(sub_sizes, 3);
+    size_t conf_bytes = region_bytes(conf_sizes, 17);
+    size_t aliased_bytes = std::max(sub_bytes, conf_bytes);
 
-    // Also need: QKV weights (24 blocks), mel_fp32
-    size_t qkv_total = (size_t)N_BLOCKS * D_MODEL * 3 * D_MODEL;
+    size_t persist_bytes = region_bytes(persist_sizes, 20);
+    size_t qkv_w_elem = (size_t)D_MODEL * 3 * D_MODEL;
+    size_t qkv_w_block = (qkv_w_elem * sizeof(half) + ALIGN - 1) & ~(ALIGN - 1);
+    size_t qkv_w_bytes = (size_t)N_BLOCKS * qkv_w_block;
+
+    size_t pool_bytes = aliased_bytes + persist_bytes + qkv_w_bytes
+                      + ALIGN + mel_fp32_elems * sizeof(float)
+                      + ALIGN + 2 * sizeof(int);
 
     char* pool;
-    // Add generous alignment padding (256 bytes per buffer)
-    int total_bufs = N_BUFS + N_BLOCKS + 2;  // +mel_fp32 +argmax_out
-    size_t pool_bytes = (total_half + qkv_total) * sizeof(half)
-                      + mel_fp32_elems * sizeof(float)
-                      + 2 * sizeof(int)  // argmax_out
-                      + (size_t)total_bufs * 256;  // alignment padding
     CUDA_CHECK(cudaMalloc(&pool, pool_bytes));
-    gpu_pool = pool;  // save for free()
+    gpu_pool = pool;
 
-    // Assign half* pointers from pool (256-byte aligned for tensor core ops)
-    constexpr size_t ALIGN = 256;
-    constexpr size_t HALF_ALIGN = ALIGN / sizeof(half);  // 128 halfs
-    char* pool_base = pool;
-    auto take = [&](size_t n) -> half* {
-        // Align pool pointer up to ALIGN boundary
-        pool = (char*)(((uintptr_t)pool + ALIGN - 1) & ~(ALIGN - 1));
-        half* r = (half*)pool;
-        pool += n * sizeof(half);
+    auto take = [](char*& cursor, size_t n) -> half* {
+        cursor = (char*)(((uintptr_t)cursor + ALIGN - 1) & ~(ALIGN - 1));
+        half* r = (half*)cursor;
+        cursor += n * sizeof(half);
         return r;
     };
 
-    sub_buf[0] = take(sizes[0]);   sub_buf[1] = take(sizes[1]);
-    mel_fp16   = take(sizes[2]);
-    x          = take(sizes[3]);   ln_out     = take(sizes[4]);
-    ff_mid     = take(sizes[5]);   ff_out     = take(sizes[6]);
-    qkv        = take(sizes[7]);
-    q          = take(sizes[8]);   k          = take(sizes[9]);
-    v          = take(sizes[10]);
-    pos_enc    = take(sizes[11]);  pos_proj   = take(sizes[12]);
-    q_u        = take(sizes[13]);  q_v_buf    = take(sizes[14]);
-    scores     = take(sizes[15]);  pos_scores = take(sizes[16]);
-    attn_out   = take(sizes[17]);  mhsa_out   = take(sizes[18]);
-    conv_mid   = take(sizes[19]);  conv_glu   = take(sizes[20]);
-    conv_dw    = take(sizes[21]);
-    lstm_input = take(sizes[22]);  lstm_gates = take(sizes[23]);
-    lstm_h[0]  = take(sizes[24]);  lstm_h[1]  = take(sizes[25]);
-    lstm_c[0]  = take(sizes[26]);  lstm_c[1]  = take(sizes[27]);
-    lstm_h_out[0] = take(sizes[28]); lstm_h_out[1] = take(sizes[29]);
-    lstm_c_out[0] = take(sizes[30]); lstm_c_out[1] = take(sizes[31]);
-    enc_proj_all = take(sizes[32]);
-    dec_proj_buf = take(sizes[33]);  joint_act = take(sizes[34]);
-    joint_out    = take(sizes[35]);
-    lstm_combined_w[0]    = take(sizes[36]);
-    lstm_combined_w[1]    = take(sizes[37]);
-    lstm_combined_bias[0] = take(sizes[38]);
-    lstm_combined_bias[1] = take(sizes[39]);
+    // --- Aliased region: subsampling pointers ---
+    char* sub_cur = pool;
+    sub_buf[0] = take(sub_cur, sub_sizes[0]);
+    sub_buf[1] = take(sub_cur, sub_sizes[1]);
+    mel_fp16   = take(sub_cur, sub_sizes[2]);
 
-    // QKV weight blocks from pool
-    for (int b = 0; b < N_BLOCKS; b++) {
-        qkv_w[b] = take(D_MODEL * 3 * D_MODEL);
-    }
+    // --- Aliased region: conformer pointers (same base — shares GPU memory) ---
+    char* conf_cur = pool;
+    ln_out     = take(conf_cur, conf_sizes[0]);
+    ff_mid     = take(conf_cur, conf_sizes[1]);
+    ff_out     = take(conf_cur, conf_sizes[2]);
+    qkv        = take(conf_cur, conf_sizes[3]);
+    q          = take(conf_cur, conf_sizes[4]);
+    k          = take(conf_cur, conf_sizes[5]);
+    v          = take(conf_cur, conf_sizes[6]);
+    pos_proj   = take(conf_cur, conf_sizes[7]);
+    q_u        = take(conf_cur, conf_sizes[8]);
+    q_v_buf    = take(conf_cur, conf_sizes[9]);
+    scores     = take(conf_cur, conf_sizes[10]);
+    pos_scores = take(conf_cur, conf_sizes[11]);
+    attn_out   = take(conf_cur, conf_sizes[12]);
+    mhsa_out   = take(conf_cur, conf_sizes[13]);
+    conv_mid   = take(conf_cur, conf_sizes[14]);
+    conv_glu   = take(conf_cur, conf_sizes[15]);
+    conv_dw    = take(conf_cur, conf_sizes[16]);
 
-    // mel_fp32 (float*) from pool, aligned
-    pool = (char*)(((uintptr_t)pool + ALIGN - 1) & ~(ALIGN - 1));
-    mel_fp32 = (float*)pool;
-    pool += mel_fp32_elems * sizeof(float);
+    // --- Persistent region (after aliased region) ---
+    char* pers_cur = pool + aliased_bytes;
+    x              = take(pers_cur, persist_sizes[0]);
+    pos_enc        = take(pers_cur, persist_sizes[1]);
+    lstm_input     = take(pers_cur, persist_sizes[2]);
+    lstm_gates     = take(pers_cur, persist_sizes[3]);
+    lstm_h[0]      = take(pers_cur, persist_sizes[4]);
+    lstm_h[1]      = take(pers_cur, persist_sizes[5]);
+    lstm_c[0]      = take(pers_cur, persist_sizes[6]);
+    lstm_c[1]      = take(pers_cur, persist_sizes[7]);
+    lstm_h_out[0]  = take(pers_cur, persist_sizes[8]);
+    lstm_h_out[1]  = take(pers_cur, persist_sizes[9]);
+    lstm_c_out[0]  = take(pers_cur, persist_sizes[10]);
+    lstm_c_out[1]  = take(pers_cur, persist_sizes[11]);
+    enc_proj_all   = take(pers_cur, persist_sizes[12]);
+    dec_proj_buf   = take(pers_cur, persist_sizes[13]);
+    joint_act      = take(pers_cur, persist_sizes[14]);
+    joint_out      = take(pers_cur, persist_sizes[15]);
+    lstm_combined_w[0]    = take(pers_cur, persist_sizes[16]);
+    lstm_combined_w[1]    = take(pers_cur, persist_sizes[17]);
+    lstm_combined_bias[0] = take(pers_cur, persist_sizes[18]);
+    lstm_combined_bias[1] = take(pers_cur, persist_sizes[19]);
 
-    // argmax_out (int[2]) from pool, aligned
-    pool = (char*)(((uintptr_t)pool + ALIGN - 1) & ~(ALIGN - 1));
-    argmax_out = (int*)pool;
-    pool += 2 * sizeof(int);
+    // QKV weight blocks (persistent, used in conformer loop)
+    for (int b = 0; b < N_BLOCKS; b++)
+        qkv_w[b] = take(pers_cur, qkv_w_elem);
+
+    // mel_fp32 (float, not half) — persistent
+    pers_cur = (char*)(((uintptr_t)pers_cur + ALIGN - 1) & ~(ALIGN - 1));
+    mel_fp32 = (float*)pers_cur;
+    pers_cur += mel_fp32_elems * sizeof(float);
+
+    // argmax_out (int[2]) — persistent
+    pers_cur = (char*)(((uintptr_t)pers_cur + ALIGN - 1) & ~(ALIGN - 1));
+    argmax_out = (int*)pers_cur;
 
     // Pre-concatenate QKV weights using cudaMemcpy2D (72 calls vs 73K row-by-row)
     for (int b = 0; b < N_BLOCKS; b++) {
