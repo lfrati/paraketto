@@ -70,7 +70,7 @@ weights-export: scripts/export_weights.py
 
 # C++ / CUDA build
 src/kernels.o: src/kernels.cu src/kernels.h
-	$(NVCC) $(NVFLAGS) -c $< -o $@
+	$(NVCC) $(NVFLAGS) -arch=sm_120 -c $< -o $@
 
 SHARED_HEADERS = src/common.h src/wav.h src/mel.h src/vocab.h src/server.h
 
@@ -86,14 +86,14 @@ CONFORMER_DEPS = src/paraketto_cuda.cpp src/conformer.cpp src/conformer.h src/ke
 
 # CUTLASS GEMM backend (default — no cuBLAS dependency, cudart only)
 src/cutlass_gemm.o: src/cutlass_gemm.cu src/cutlass_gemm.h src/gemm.h src/kernels.h
-	$(NVCC) $(NVFLAGS) -arch=sm_80 $(CUTLASS_INC) -c $< -o $@
+	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) -c $< -o $@
 
 paraketto.cuda: $(CONFORMER_DEPS) src/kernels.o src/cutlass_gemm.o src/cutlass_gemm.h
 	$(CXX) $(CUDA_CXXFLAGS) src/paraketto_cuda.cpp src/conformer.cpp src/kernels.o src/cutlass_gemm.o $(CUDA_LDFLAGS) -o $@
 
 # cuBLAS GEMM backend (faster on some shapes, requires libcublas)
 src/cublas_gemm.o: src/cublas_gemm.cu src/gemm.h src/kernels.h
-	$(NVCC) $(NVFLAGS) -c $< -o $@
+	$(NVCC) $(NVFLAGS) -arch=sm_120 -c $< -o $@
 
 paraketto.cublas: $(CONFORMER_DEPS) src/kernels.o src/cublas_gemm.o
 	$(CXX) $(CUDA_CXXFLAGS) src/paraketto_cuda.cpp src/conformer.cpp src/kernels.o src/cublas_gemm.o $(CUDA_LDFLAGS) -lcublas -lcublasLt -o $@
@@ -110,6 +110,18 @@ paraketto.static: $(CONFORMER_DEPS) src/kernels.o src/cutlass_gemm.o src/cutlass
 		-static-libstdc++ -static-libgcc \
 		-L$(CUDA_HOME)/lib64 $(CUDA_HOME)/lib64/libcudart_static.a -ldl -lpthread -lrt \
 		-o $@
+
+bench_gemm: tests/bench_gemm.cu
+	$(NVCC) $(NVFLAGS) -arch=sm_80 $(CUTLASS_INC) tests/bench_gemm.cu -lcublas -lcublasLt -o $@
+
+bench_splitk: tests/bench_splitk.cu
+	$(NVCC) $(NVFLAGS) -arch=sm_80 $(CUTLASS_INC) tests/bench_splitk.cu -lcublas -lcublasLt -o $@
+
+bench_tiles: tests/bench_tiles.cu
+	$(NVCC) $(NVFLAGS) -arch=sm_80 $(CUTLASS_INC) tests/bench_tiles.cu -lcublas -lcublasLt -o $@
+
+bench_ff2: tests/bench_ff2.cu
+	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) tests/bench_ff2.cu -lcublas -lcublasLt -o $@
 
 clean:
 	rm -f paraketto paraketto.cuda paraketto.cublas paraketto.static src/kernels.o src/cutlass_gemm.o src/cublas_gemm.o weights_embedded.o
