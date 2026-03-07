@@ -11,7 +11,7 @@ CXXFLAGS = -std=c++17 -O3 -march=native -flto=auto -Wno-deprecated-declarations 
 NVFLAGS  = -std=c++17 -O3 -I$(CUDA_HOME)/include -Isrc --expt-relaxed-constexpr
 LDFLAGS  = -flto=auto -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lpthread $(TRT_LIBS)/libnvinfer.so.10 -Wl,-rpath,$(TRT_LIBS)
 
-.PHONY: bench-all bench-py bench-cpp bench-cuda bench-cublas engines inspect-onnx weights weights-fp8 download-data download-weights clean
+.PHONY: bench-all bench-py bench-cpp bench-cuda bench-cublas bench-fp8 engines inspect-onnx weights weights-fp8 download-data download-weights clean
 
 # Download benchmark data from GitHub release
 data/librispeech/manifest.json:
@@ -44,11 +44,11 @@ bench-all: paraketto engines/encoder.engine engines/decoder_joint.engine paraket
 	$(call BENCH_SEP,C++ TRT ·  paraketto.cpp + TensorRT)
 	@uv run python tests/bench_cpp.py
 	$(call BENCH_SEP,C++ CUDA · paraketto_cuda.cpp + CUTLASS FP16)
-	@uv run python tests/bench_cuda.py paraketto.cuda
+	@uv run python tests/bench_native.py paraketto.cuda
 	$(call BENCH_SEP,C++ cuBLAS · paraketto_cuda.cpp + cuBLAS FP16)
-	@uv run python tests/bench_cuda.py paraketto.cublas
+	@uv run python tests/bench_native.py paraketto.cublas
 	$(call BENCH_SEP,C++ FP8  · paraketto_cuda.cpp + cublasLt FP8)
-	@uv run python tests/bench_cuda.py paraketto.fp8
+	@uv run python tests/bench_native.py paraketto.fp8
 
 bench-py: data/librispeech/manifest.json
 	uv run python tests/bench.py
@@ -57,10 +57,13 @@ bench-cpp: paraketto engines/encoder.engine engines/decoder_joint.engine data/li
 	uv run python tests/bench_cpp.py
 
 bench-cuda: paraketto.cuda data/librispeech/manifest.json weights.bin
-	uv run python tests/bench_cuda.py paraketto.cuda
+	uv run python tests/bench_native.py paraketto.cuda
 
 bench-cublas: paraketto.cublas data/librispeech/manifest.json weights.bin
-	uv run python tests/bench_cuda.py paraketto.cublas
+	uv run python tests/bench_native.py paraketto.cublas
+
+bench-fp8: paraketto.fp8 data/librispeech/manifest.json weights_fp8.bin
+	uv run python tests/bench_native.py paraketto.fp8
 
 # ONNX inspection and weight export
 inspect-onnx:
