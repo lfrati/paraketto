@@ -1,21 +1,19 @@
 // weights.cpp — Weight loading shared by FP16 and FP8 backends
-
-// weights.cpp — Weight loading shared by FP16 and FP8 backends
 //
-// Loads weights.bin into a single contiguous GPU allocation and assigns
-// struct field pointers. Linked by paraketto.cuda, .cublas, and .fp8.
+// weights.bin format:
+//   uint32 magic   = WEIGHTS_MAGIC (0x544B5250 "PRKT")
+//   uint32 version = WEIGHTS_VERSION (2)
+//   [raw FP16 tensors, 256-byte aligned, in the fixed order below]
+//
+// The layout defined here IS the file format. No separate index or header.
+// Changing this layout requires regenerating weights.bin (run repack_weights.py).
 
 #include "conformer.h"
 #include "common.h"
-#include "kernels.h"
 
-#include <cassert>
-#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <sstream>
-#include <string>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -23,113 +21,92 @@
 #include <unistd.h>
 
 // ---------------------------------------------------------------------------
-// Helper: align up
+// Weight layout — assigns pointers and computes total GPU allocation size.
+//
+// Tensors are placed in a fixed order with 256-byte alignment between them.
+// This order matches export_weights.py / repack_weights.py exactly.
+// Returns total bytes needed (== file size minus the 8-byte header).
 // ---------------------------------------------------------------------------
 
-static size_t align_up(size_t x, size_t alignment) {
-    return (x + alignment - 1) & ~(alignment - 1);
-}
+static size_t assign_weight_pointers(Weights& w) {
+    uint8_t* base = (uint8_t*)w.gpu_data;  // null during size computation
+    size_t off = 0;
 
-// ---------------------------------------------------------------------------
-// Parse header
-// ---------------------------------------------------------------------------
-
-static std::vector<TensorDesc> parse_header(const char* header_text, size_t header_len) {
-    std::vector<TensorDesc> tensors;
-    std::string text(header_text, header_len);
-    std::istringstream iss(text);
-    std::string line;
-
-    while (std::getline(iss, line)) {
-        if (line.empty()) continue;
-        std::istringstream ls(line);
-        TensorDesc td;
-        ls >> td.name >> td.offset >> td.size_bytes >> td.dtype;
-        int d;
-        while (ls >> d) td.shape.push_back(d);
-        tensors.push_back(std::move(td));
-    }
-    return tensors;
-}
-
-// ---------------------------------------------------------------------------
-// Weights: pointer assignment (shared by load and upload)
-// ---------------------------------------------------------------------------
-
-static void assign_weight_pointers(Weights& w) {
-    uint8_t* gpu_base = (uint8_t*)w.gpu_data;
-
-    auto lookup = [&](const std::string& name) -> half* {
-        auto it = w.name_to_idx.find(name);
-        if (it == w.name_to_idx.end()) return nullptr;
-        return (half*)(gpu_base + w.tensors[it->second].offset);
+    auto take = [&](half*& ptr, size_t n) {
+        off = (off + 255) & ~(size_t)255;
+        if (base) ptr = (half*)(base + off);
+        off += n * sizeof(half);
     };
 
-    // Subsampling (pre_encode)
-    for (int i : {0, 2, 3, 5, 6}) {
-        std::string pre = "encoder/pre_encode.conv." + std::to_string(i);
-        w.sub_conv[i].weight = lookup(pre + ".weight");
-        w.sub_conv[i].bias   = lookup(pre + ".bias");
-    }
-    w.sub_out_w = lookup("encoder/pre_encode.out.weight");
-    w.sub_out_b = lookup("encoder/pre_encode.out.bias");
+    // --- Subsampling (pre_encode) ---
+    // conv.0, .2, .5: depthwise [256, 1, 3, 3] = 256*9 elements
+    // conv.3, .6:     pointwise [256, 256, 1, 1] = 256*256 elements
+    take(w.sub_conv[0].weight, SUB_CHANNELS * 9);
+    take(w.sub_conv[0].bias,   SUB_CHANNELS);
+    take(w.sub_conv[2].weight, SUB_CHANNELS * 9);
+    take(w.sub_conv[2].bias,   SUB_CHANNELS);
+    take(w.sub_conv[3].weight, (size_t)SUB_CHANNELS * SUB_CHANNELS);
+    take(w.sub_conv[3].bias,   SUB_CHANNELS);
+    take(w.sub_conv[5].weight, SUB_CHANNELS * 9);
+    take(w.sub_conv[5].bias,   SUB_CHANNELS);
+    take(w.sub_conv[6].weight, (size_t)SUB_CHANNELS * SUB_CHANNELS);
+    take(w.sub_conv[6].bias,   SUB_CHANNELS);
+    take(w.sub_out_w,          (size_t)SUB_CHANNELS * 16 * D_MODEL);  // [4096, 1024]
+    take(w.sub_out_b,          D_MODEL);
 
-    // Conformer blocks (x24)
-    for (int i = 0; i < 24; i++) {
+    // --- 24 conformer blocks ---
+    for (int i = 0; i < N_BLOCKS; i++) {
         auto& blk = w.blocks[i];
-        std::string pre = "encoder/layers." + std::to_string(i);
-
-        blk.ff1_ln_w = lookup(pre + ".norm_feed_forward1.weight");
-        blk.ff1_ln_b = lookup(pre + ".norm_feed_forward1.bias");
-        blk.ff1_w1   = lookup(pre + ".feed_forward1.linear1.weight");
-        blk.ff1_w2   = lookup(pre + ".feed_forward1.linear2.weight");
-
-        blk.mhsa_ln_w = lookup(pre + ".norm_self_att.weight");
-        blk.mhsa_ln_b = lookup(pre + ".norm_self_att.bias");
-        blk.q_w       = lookup(pre + ".self_attn.linear_q.weight");
-        blk.k_w       = lookup(pre + ".self_attn.linear_k.weight");
-        blk.v_w       = lookup(pre + ".self_attn.linear_v.weight");
-        blk.pos_w     = lookup(pre + ".self_attn.linear_pos.weight");
-        blk.pos_bias_u = lookup(pre + ".self_attn.pos_bias_u");
-        blk.pos_bias_v = lookup(pre + ".self_attn.pos_bias_v");
-        blk.out_w     = lookup(pre + ".self_attn.linear_out.weight");
-
-        blk.conv_ln_w  = lookup(pre + ".norm_conv.weight");
-        blk.conv_ln_b  = lookup(pre + ".norm_conv.bias");
-        blk.conv_pw1_w = lookup(pre + ".conv.pointwise_conv1.weight");
-        blk.conv_dw_w  = lookup(pre + ".conv.depthwise_conv.weight");
-        blk.conv_dw_b  = lookup(pre + ".conv.depthwise_conv.bias");
-        blk.conv_pw2_w = lookup(pre + ".conv.pointwise_conv2.weight");
-
-        blk.ff2_ln_w = lookup(pre + ".norm_feed_forward2.weight");
-        blk.ff2_ln_b = lookup(pre + ".norm_feed_forward2.bias");
-        blk.ff2_w1   = lookup(pre + ".feed_forward2.linear1.weight");
-        blk.ff2_w2   = lookup(pre + ".feed_forward2.linear2.weight");
-
-        blk.final_ln_w = lookup(pre + ".norm_out.weight");
-        blk.final_ln_b = lookup(pre + ".norm_out.bias");
+        take(blk.ff1_ln_w,   D_MODEL);
+        take(blk.ff1_ln_b,   D_MODEL);
+        take(blk.ff1_w1,     (size_t)D_MODEL * D_FF);    // [1024, 4096]
+        take(blk.ff1_w2,     (size_t)D_FF   * D_MODEL);  // [4096, 1024]
+        take(blk.mhsa_ln_w,  D_MODEL);
+        take(blk.mhsa_ln_b,  D_MODEL);
+        take(blk.q_w,        (size_t)D_MODEL * D_MODEL);
+        take(blk.k_w,        (size_t)D_MODEL * D_MODEL);
+        take(blk.v_w,        (size_t)D_MODEL * D_MODEL);
+        take(blk.pos_w,      (size_t)D_MODEL * D_MODEL);
+        take(blk.pos_bias_u, (size_t)N_HEADS * HEAD_DIM);  // [8, 128]
+        take(blk.pos_bias_v, (size_t)N_HEADS * HEAD_DIM);
+        take(blk.out_w,      (size_t)D_MODEL * D_MODEL);
+        take(blk.conv_ln_w,  D_MODEL);
+        take(blk.conv_ln_b,  D_MODEL);
+        take(blk.conv_pw1_w, (size_t)D_CONV_PW * D_MODEL);  // [2048, 1024]
+        take(blk.conv_dw_w,  (size_t)D_MODEL   * CONV_K);   // [1024, 9]
+        take(blk.conv_dw_b,  D_MODEL);
+        take(blk.conv_pw2_w, (size_t)D_MODEL   * D_MODEL);
+        take(blk.ff2_ln_w,   D_MODEL);
+        take(blk.ff2_ln_b,   D_MODEL);
+        take(blk.ff2_w1,     (size_t)D_MODEL * D_FF);
+        take(blk.ff2_w2,     (size_t)D_FF   * D_MODEL);
+        take(blk.final_ln_w, D_MODEL);
+        take(blk.final_ln_b, D_MODEL);
     }
 
-    // Decoder: embedding + LSTM
-    w.embed_w = lookup("decoder/decoder.prediction.embed.weight");
-    w.lstm0_w_ih = lookup("decoder/decoder.dec_rnn.lstm.weight_ih");
-    w.lstm0_w_hh = lookup("decoder/decoder.dec_rnn.lstm.weight_hh");
-    w.lstm0_bias = lookup("decoder/decoder.dec_rnn.lstm.bias");
-    w.lstm1_w_ih = lookup("decoder/decoder.dec_rnn.lstm.1.weight_ih");
-    w.lstm1_w_hh = lookup("decoder/decoder.dec_rnn.lstm.1.weight_hh");
-    w.lstm1_bias = lookup("decoder/decoder.dec_rnn.lstm.1.bias");
+    // --- Decoder ---
+    take(w.embed_w,    (size_t)N_VOCAB * D_PRED);        // [1025, 640]
+    take(w.lstm0_w_ih, (size_t)4 * D_PRED * D_PRED);    // [1, 2560, 640]
+    take(w.lstm0_w_hh, (size_t)4 * D_PRED * D_PRED);
+    take(w.lstm0_bias,  8 * D_PRED);                     // [1, 5120] = b_ih||b_hh
+    take(w.lstm1_w_ih, (size_t)4 * D_PRED * D_PRED);
+    take(w.lstm1_w_hh, (size_t)4 * D_PRED * D_PRED);
+    take(w.lstm1_bias,  8 * D_PRED);
 
-    // Joint network
-    w.enc_proj_w = lookup("decoder/joint.enc.weight");
-    w.enc_proj_b = lookup("decoder/joint.enc.bias");
-    w.dec_proj_w = lookup("decoder/joint.pred.weight");
-    w.dec_proj_b = lookup("decoder/joint.pred.bias");
-    w.out_proj_w = lookup("decoder/joint.joint_net.joint_net.2.weight");
-    w.out_proj_b = lookup("decoder/joint.joint_net.2.bias");
+    // --- Joint network ---
+    take(w.enc_proj_w, (size_t)D_MODEL * D_JOINT);   // [1024, 640]
+    take(w.enc_proj_b, D_JOINT);
+    take(w.dec_proj_w, (size_t)D_PRED  * D_JOINT);   // [640, 640]
+    take(w.dec_proj_b, D_JOINT);
+    take(w.out_proj_w, (size_t)D_JOINT * D_OUTPUT);  // [640, 1030]
+    take(w.out_proj_b, D_OUTPUT);
+
+    off = (off + 255) & ~(size_t)255;
+    return off;
 }
 
 // ---------------------------------------------------------------------------
-// Weights::prefetch — CPU only, no CUDA. mmap + populate pages + parse header.
+// Weights::prefetch — mmap weights.bin (CPU only, no CUDA)
 // ---------------------------------------------------------------------------
 
 Weights Weights::prefetch(const std::string& path, bool populate) {
@@ -142,7 +119,7 @@ Weights Weights::prefetch(const std::string& path, bool populate) {
     }
     struct stat st;
     fstat(fd, &st);
-    size_t file_size = st.st_size;
+    size_t file_size = (size_t)st.st_size;
     int flags = MAP_PRIVATE | (populate ? MAP_POPULATE : 0);
     void* mapped = mmap(nullptr, file_size, PROT_READ, flags, fd, 0);
     close(fd);
@@ -151,158 +128,98 @@ Weights Weights::prefetch(const std::string& path, bool populate) {
         std::exit(1);
     }
     if (populate) madvise(mapped, file_size, MADV_SEQUENTIAL);
+
+    // Validate header
     const uint8_t* base = (const uint8_t*)mapped;
-
-    // Parse file header
-    uint32_t magic;
-    memcpy(&magic, base, 4);
-    if (magic != PRKT_MAGIC) {
-        fprintf(stderr, "Bad magic in %s: expected PRKT\n", path.c_str());
-        munmap(mapped, file_size);
-        std::exit(1);
-    }
-
-    uint32_t version;
+    uint32_t magic, version;
+    memcpy(&magic,   base,     4);
     memcpy(&version, base + 4, 4);
-    if (version != PRKT_VERSION) {
-        fprintf(stderr, "Unsupported weight file version %u (expected %u)\n", version, PRKT_VERSION);
+    if (magic != WEIGHTS_MAGIC || version != WEIGHTS_VERSION) {
+        fprintf(stderr, "Bad weights file %s (magic=0x%08x version=%u, expected magic=0x%08x version=%u)\n",
+                path.c_str(), magic, version, WEIGHTS_MAGIC, WEIGHTS_VERSION);
         munmap(mapped, file_size);
         std::exit(1);
     }
 
-    uint64_t header_len;
-    memcpy(&header_len, base + 8, 8);
-    w.tensors = parse_header((const char*)(base + 16), header_len);
-
-    for (size_t i = 0; i < w.tensors.size(); i++)
-        w.name_to_idx[w.tensors[i].name] = i;
-
-    size_t header_end = 16 + header_len;
-    size_t data_start = align_up(header_end, HEADER_ALIGN);
-
-    size_t total_data = 0;
-    for (auto& td : w.tensors) {
-        size_t end = td.offset + td.size_bytes;
-        if (end > total_data) total_data = end;
-    }
-    if (!w.tensors.empty()) {
-        auto& last = w.tensors.back();
-        total_data = std::max(total_data, align_up(last.offset + last.size_bytes, 256));
-    }
-
-    w.gpu_data_size = total_data;
-    w.mmap_ptr = mapped;
+    w.mmap_ptr  = mapped;
     w.mmap_size = file_size;
-    w.data_offset = data_start;
-
     return w;
 }
 
 // ---------------------------------------------------------------------------
-// Weights::from_embedded — parse header from in-memory data (no mmap).
+// Weights::from_embedded — point at in-memory data (static binary)
 // ---------------------------------------------------------------------------
 
 Weights Weights::from_embedded(const uint8_t* data, size_t size) {
     Weights w;
-    const uint8_t* base = data;
-
-    uint32_t magic;
-    memcpy(&magic, base, 4);
-    if (magic != PRKT_MAGIC) {
-        fprintf(stderr, "Bad magic in embedded weights\n");
+    // Validate header
+    uint32_t magic, version;
+    memcpy(&magic,   data,     4);
+    memcpy(&version, data + 4, 4);
+    if (magic != WEIGHTS_MAGIC || version != WEIGHTS_VERSION) {
+        fprintf(stderr, "Bad embedded weights (magic=0x%08x version=%u)\n", magic, version);
         std::exit(1);
     }
-
-    uint32_t version;
-    memcpy(&version, base + 4, 4);
-    if (version != PRKT_VERSION) {
-        fprintf(stderr, "Unsupported embedded weight version %u (expected %u)\n", version, PRKT_VERSION);
-        std::exit(1);
-    }
-
-    uint64_t header_len;
-    memcpy(&header_len, base + 8, 8);
-    w.tensors = parse_header((const char*)(base + 16), header_len);
-
-    for (size_t i = 0; i < w.tensors.size(); i++)
-        w.name_to_idx[w.tensors[i].name] = i;
-
-    size_t header_end = 16 + header_len;
-    size_t data_start = align_up(header_end, HEADER_ALIGN);
-
-    size_t total_data = 0;
-    for (auto& td : w.tensors) {
-        size_t end = td.offset + td.size_bytes;
-        if (end > total_data) total_data = end;
-    }
-    if (!w.tensors.empty()) {
-        auto& last = w.tensors.back();
-        total_data = std::max(total_data, align_up(last.offset + last.size_bytes, 256));
-    }
-
-    w.gpu_data_size = total_data;
-    w.mmap_ptr = nullptr;       // not mmap'd — don't munmap
-    w.mmap_size = 0;
-    w.data_offset = data_start;
-    w.embedded_ptr = data;       // store for upload
-
+    w.embedded_ptr = data;
+    w.mmap_size    = size;
     return w;
 }
 
 // ---------------------------------------------------------------------------
-// Weights::allocate_only — cudaMalloc without data copy (FP8 path: data comes
-// from weights_fp8.bin which is self-contained).
-// ---------------------------------------------------------------------------
-
-void Weights::allocate_only() {
-    CUDA_CHECK(cudaMalloc(&gpu_data, gpu_data_size));
-    if (mmap_ptr) {
-        munmap(mmap_ptr, mmap_size);
-        mmap_ptr = nullptr;
-        mmap_size = 0;
-    }
-    embedded_ptr = nullptr;
-    data_offset = 0;
-    assign_weight_pointers(*this);
-}
-
-// ---------------------------------------------------------------------------
-// Weights::upload — cudaMalloc + cudaMemcpy from prefetched mmap, assign ptrs.
+// Weights::upload — cudaMalloc + copy from prefetched/embedded data
 // ---------------------------------------------------------------------------
 
 void Weights::upload(cudaStream_t stream) {
-    const uint8_t* base = embedded_ptr ? embedded_ptr : (const uint8_t*)mmap_ptr;
+    const uint8_t* src = embedded_ptr ? embedded_ptr : (const uint8_t*)mmap_ptr;
+    const uint8_t* data = src + WEIGHTS_HEADER;  // skip 8-byte header
 
+    // Compute GPU allocation size from layout
+    gpu_data_size = assign_weight_pointers(*this);  // gpu_data=null → compute only
     CUDA_CHECK(cudaMalloc(&gpu_data, gpu_data_size));
 
+    // Validate file data size
+    size_t expected_file = WEIGHTS_HEADER + gpu_data_size;
+    if (mmap_size != expected_file) {
+        fprintf(stderr, "Weight file size mismatch: expected %zu, got %zu\n",
+                expected_file, mmap_size);
+        std::exit(1);
+    }
+
     if (stream) {
-        CUDA_CHECK(cudaMemcpyAsync(gpu_data, base + data_offset, gpu_data_size,
+        CUDA_CHECK(cudaMemcpyAsync(gpu_data, data, gpu_data_size,
                                     cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
     } else {
-        CUDA_CHECK(cudaMemcpy(gpu_data, base + data_offset, gpu_data_size,
+        CUDA_CHECK(cudaMemcpy(gpu_data, data, gpu_data_size,
                                cudaMemcpyHostToDevice));
     }
 
     if (mmap_ptr) {
         munmap(mmap_ptr, mmap_size);
-        mmap_ptr = nullptr;
+        mmap_ptr  = nullptr;
         mmap_size = 0;
     }
     embedded_ptr = nullptr;
-    data_offset = 0;
 
-    assign_weight_pointers(*this);
+    assign_weight_pointers(*this);  // assign real pointers into gpu_data
 }
 
 // ---------------------------------------------------------------------------
-// Weights::load — convenience: prefetch + upload in one call.
+// Weights::allocate_only — FP8 path: malloc without data upload
 // ---------------------------------------------------------------------------
 
-Weights Weights::load(const std::string& path, cudaStream_t stream) {
-    Weights w = prefetch(path);
-    w.upload(stream);
-    return w;
+void Weights::allocate_only() {
+    gpu_data_size = assign_weight_pointers(*this);  // compute with gpu_data=null
+    CUDA_CHECK(cudaMalloc(&gpu_data, gpu_data_size));
+
+    if (mmap_ptr) {
+        munmap(mmap_ptr, mmap_size);
+        mmap_ptr  = nullptr;
+        mmap_size = 0;
+    }
+    embedded_ptr = nullptr;
+
+    assign_weight_pointers(*this);  // assign pointers into gpu_data
 }
 
 // ---------------------------------------------------------------------------
@@ -312,77 +229,7 @@ Weights Weights::load(const std::string& path, cudaStream_t stream) {
 void Weights::free() {
     if (gpu_data) {
         cudaFree(gpu_data);
-        gpu_data = nullptr;
+        gpu_data      = nullptr;
         gpu_data_size = 0;
     }
 }
-
-// ---------------------------------------------------------------------------
-// Weights::get
-// ---------------------------------------------------------------------------
-
-half* Weights::get(const std::string& name) const {
-    auto it = name_to_idx.find(name);
-    if (it == name_to_idx.end()) return nullptr;
-    return (half*)((uint8_t*)gpu_data + tensors[it->second].offset);
-}
-
-// ---------------------------------------------------------------------------
-// Weights::print_info
-// ---------------------------------------------------------------------------
-
-void Weights::print_info() const {
-    fprintf(stderr, "weights: %zu tensors, %.1f MB GPU\n",
-            tensors.size(), gpu_data_size / (1024.0 * 1024.0));
-
-    // Check key struct fields are populated
-    int missing = 0;
-    auto check = [&](const char* label, const half* ptr) {
-        if (!ptr) {
-            fprintf(stderr, "  WARNING: %s not found in weight file\n", label);
-            missing++;
-        }
-    };
-
-    // Subsampling
-    check("sub_conv[0].weight", sub_conv[0].weight);
-    check("sub_conv[6].weight", sub_conv[6].weight);
-    check("sub_out_w", sub_out_w);
-
-    // Conformer blocks (spot check first and last)
-    check("blocks[0].ff1_w1", blocks[0].ff1_w1);
-    check("blocks[0].q_w", blocks[0].q_w);
-    check("blocks[0].k_w", blocks[0].k_w);
-    check("blocks[0].v_w", blocks[0].v_w);
-    check("blocks[0].conv_dw_w", blocks[0].conv_dw_w);
-    check("blocks[23].ff2_w2", blocks[23].ff2_w2);
-    check("blocks[23].final_ln_w", blocks[23].final_ln_w);
-
-    // Decoder
-    check("embed_w", embed_w);
-    check("lstm0_w_ih", lstm0_w_ih);
-    check("lstm0_bias", lstm0_bias);
-    check("lstm1_w_ih", lstm1_w_ih);
-    check("lstm1_bias", lstm1_bias);
-
-    // Joint
-    check("enc_proj_w", enc_proj_w);
-    check("dec_proj_w", dec_proj_w);
-    check("out_proj_w", out_proj_w);
-    check("out_proj_b", out_proj_b);
-
-    if (missing > 0) {
-        fprintf(stderr, "  %d key weights missing — run 'make inspect-onnx' to check names\n", missing);
-    } else {
-        fprintf(stderr, "  all key weights mapped successfully\n");
-    }
-}
-
-// =========================================================================
-// CudaModel — encoder + decoder forward pass
-// =========================================================================
-
-// ---------------------------------------------------------------------------
-// CudaModel::init
-// ---------------------------------------------------------------------------
-

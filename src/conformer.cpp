@@ -255,17 +255,6 @@ void CudaModel::free() {
 
 // Position encoding generation moved to GPU kernel (generate_pos_encoding_gpu)
 
-// ---------------------------------------------------------------------------
-// CudaModel::encode
-// ---------------------------------------------------------------------------
-
-int CudaModel::encode(const float* mel_fp32_host, int T_mel) {
-    // Upload mel from host then delegate to encode_gpu
-    CUDA_CHECK(cudaMemcpyAsync(mel_fp32, mel_fp32_host, 128 * T_mel * sizeof(float),
-                                cudaMemcpyHostToDevice, stream));
-    return encode_gpu(T_mel);
-}
-
 int CudaModel::encode_gpu(int T_mel) {
     // Local GEMM helpers that capture stream
     auto gnn = [&](const half* X, int m, int k, const half* W, int n, half* Y) {

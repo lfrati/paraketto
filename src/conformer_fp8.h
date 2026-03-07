@@ -1,20 +1,15 @@
-// conformer.h — Weight loading + CUDA inference for Parakeet conformer
+// conformer_fp8.h — FP8 CudaModel (cublasLt E4M3 backend)
 //
-// Defines:
-//   Weights  — pointers into GPU weight allocation (loaded from weights.bin)
-//   CudaModel — pre-allocated buffers + cuBLAS handle for forward passes
+// Included via -include flag for the FP8 build, overriding conformer.h.
+// Defines PARAKETTO_FP8 and extends CudaModel with FP8 quantization fields.
 
 #ifndef CONFORMER_H_
 #define CONFORMER_H_
-// FP8 variant — includes extra CudaModel members for FP8 quantization
 #define PARAKETTO_FP8 1
 
 #include <cstddef>
 #include <cstdint>
 #include <string>
-#include <unordered_map>
-#include <utility>
-#include <vector>
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -22,294 +17,202 @@
 #include <cublasLt.h>
 
 // ---------------------------------------------------------------------------
-// Weight file format constants
+// Weight file format
 // ---------------------------------------------------------------------------
+//
+// weights.bin (FP16 source, needed only for first-run FP8 quantization):
+//   uint32 magic   = 0x544B5250 ("PRKT")
+//   uint32 version = 2
+//   [raw FP16 tensor data, 256-byte aligned, fixed layout from source]
+//
+// weights_fp8.bin (self-contained FP8 weights, all needed data):
+//   char[8] magic  = "PRKTFP8\0"
+//   uint32  version = 1
+//   uint32  pad     = 0
+//   [fp8_pool blob: FP8 quantized weights + scales, pool layout, single cudaMemcpy]
+//   [non-GEMM FP16 blob: LN, biases, conv_dw, embed, LSTM, decoder — packed]
+//
+// Tensor layout for both files is defined in source (weights.cpp / conformer_fp8.cpp).
 
-static constexpr uint32_t PRKT_MAGIC   = 0x544B5250;  // "PRKT" little-endian
-static constexpr uint32_t PRKT_VERSION = 1;
-static constexpr size_t   HEADER_ALIGN = 4096;
+static constexpr uint32_t WEIGHTS_MAGIC    = 0x544B5250;  // "PRKT"
+static constexpr uint32_t WEIGHTS_VERSION  = 2;
+static constexpr size_t   WEIGHTS_HEADER   = 8;  // magic(4) + version(4)
 
-// ---------------------------------------------------------------------------
-// Tensor descriptor (parsed from header)
-// ---------------------------------------------------------------------------
-
-struct TensorDesc {
-    std::string name;
-    size_t offset;       // offset from data start
-    size_t size_bytes;
-    std::string dtype;
-    std::vector<int> shape;
-};
-
-// ---------------------------------------------------------------------------
-// Weights struct — all model weights on GPU
-// ---------------------------------------------------------------------------
-
-struct Weights {
-    void* gpu_data = nullptr;        // single contiguous GPU allocation
-    size_t gpu_data_size = 0;
-
-    // Prefetch state (temporary — cleared after upload)
-    void* mmap_ptr = nullptr;
-    size_t mmap_size = 0;
-    size_t data_offset = 0;          // offset to data section within mmap
-    const uint8_t* embedded_ptr = nullptr;  // non-null if from_embedded()
-
-    // Parsed index (kept for diagnostics)
-    std::vector<TensorDesc> tensors;
-    std::unordered_map<std::string, size_t> name_to_idx;
-
-    // ---------------------------------------------------------------------------
-    // Subsampling (pre_encode): 5 conv layers + 1 linear projection
-    //   conv.0: depthwise [256, 1, 3, 3] stride=2
-    //   conv.2: depthwise [256, 1, 3, 3] stride=2
-    //   conv.3: pointwise [256, 256, 1, 1]
-    //   conv.5: depthwise [256, 1, 3, 3] stride=2
-    //   conv.6: pointwise [256, 256, 1, 1]
-    //   out:    linear    [4096, 1024] (flattened 256*16 -> 1024)
-    // ---------------------------------------------------------------------------
-    struct SubConv {
-        half *weight = nullptr, *bias = nullptr;
-    };
-    SubConv sub_conv[7];  // indexed by conv layer number (0,2,3,5,6 used; 1,4 unused)
-    half *sub_out_w = nullptr, *sub_out_b = nullptr;  // pre_encode.out
-
-    // ---------------------------------------------------------------------------
-    // Conformer blocks (x24)
-    //
-    // Per block tensors (from ONNX inspection):
-    //   norm_feed_forward1.{weight,bias}     LayerNorm
-    //   feed_forward1.linear1.weight         [1024, 4096] (no bias)
-    //   feed_forward1.linear2.weight         [4096, 1024]
-    //   norm_self_att.{weight,bias}          LayerNorm
-    //   self_attn.linear_q.weight            [1024, 1024]
-    //   self_attn.linear_k.weight            [1024, 1024]
-    //   self_attn.linear_v.weight            [1024, 1024]
-    //   self_attn.linear_pos.weight          [1024, 1024]
-    //   self_attn.pos_bias_u                 [8, 128]
-    //   self_attn.pos_bias_v                 [8, 128]
-    //   self_attn.linear_out.weight          [1024, 1024]
-    //   norm_conv.{weight,bias}              LayerNorm
-    //   conv.pointwise_conv1.weight          [2048, 1024, 1]
-    //   conv.depthwise_conv.{weight,bias}    [1024, 1, 9] + [1024]
-    //   conv.pointwise_conv2.weight          [1024, 1024, 1]
-    //   norm_feed_forward2.{weight,bias}     LayerNorm
-    //   feed_forward2.linear1.weight         [1024, 4096]
-    //   feed_forward2.linear2.weight         [4096, 1024]
-    //   norm_out.{weight,bias}               LayerNorm
-    // ---------------------------------------------------------------------------
-    struct ConformerBlock {
-        // FF1
-        half *ff1_ln_w = nullptr, *ff1_ln_b = nullptr;
-        half *ff1_w1 = nullptr;   // [1024, 4096]
-        half *ff1_w2 = nullptr;   // [4096, 1024]
-
-        // MHSA
-        half *mhsa_ln_w = nullptr, *mhsa_ln_b = nullptr;
-        half *q_w = nullptr;      // [1024, 1024]
-        half *k_w = nullptr;      // [1024, 1024]
-        half *v_w = nullptr;      // [1024, 1024]
-        half *pos_w = nullptr;    // [1024, 1024] (linear_pos)
-        half *pos_bias_u = nullptr;  // [8, 128]
-        half *pos_bias_v = nullptr;  // [8, 128]
-        half *out_w = nullptr;    // [1024, 1024]
-
-        // Conv module
-        half *conv_ln_w = nullptr, *conv_ln_b = nullptr;
-        half *conv_pw1_w = nullptr;   // [2048, 1024, 1]
-        half *conv_dw_w = nullptr;    // [1024, 1, 9]
-        half *conv_dw_b = nullptr;    // [1024]
-        half *conv_pw2_w = nullptr;   // [1024, 1024, 1]
-
-        // FF2
-        half *ff2_ln_w = nullptr, *ff2_ln_b = nullptr;
-        half *ff2_w1 = nullptr;   // [1024, 4096]
-        half *ff2_w2 = nullptr;   // [4096, 1024]
-
-        // Final LN
-        half *final_ln_w = nullptr, *final_ln_b = nullptr;
-    } blocks[24];
-
-    // ---------------------------------------------------------------------------
-    // Decoder (prediction network)
-    //   ONNX LSTM format: weight_ih [1, 4*H, input], weight_hh [1, 4*H, H],
-    //   bias [1, 8*H] (concatenated input+recurrent biases)
-    // ---------------------------------------------------------------------------
-    half *embed_w = nullptr;  // [1025, 640]
-
-    // LSTM layer 0 (no suffix in name)
-    half *lstm0_w_ih = nullptr;  // [1, 2560, 640]
-    half *lstm0_w_hh = nullptr;  // [1, 2560, 640]
-    half *lstm0_bias = nullptr;  // [1, 5120]
-
-    // LSTM layer 1 (suffix ".1" in name)
-    half *lstm1_w_ih = nullptr;  // [1, 2560, 640]
-    half *lstm1_w_hh = nullptr;  // [1, 2560, 640]
-    half *lstm1_bias = nullptr;  // [1, 5120]
-
-    // ---------------------------------------------------------------------------
-    // Joint network
-    // ---------------------------------------------------------------------------
-    half *enc_proj_w = nullptr, *enc_proj_b = nullptr;   // [1024, 640] + [640]
-    half *dec_proj_w = nullptr, *dec_proj_b = nullptr;   // [640, 640] + [640]
-    half *out_proj_w = nullptr, *out_proj_b = nullptr;   // [640, 1030] + [1030]
-
-    // ---------------------------------------------------------------------------
-    // Methods
-    // ---------------------------------------------------------------------------
-
-    /// Load weights from a .bin file produced by export_weights.py.
-    static Weights load(const std::string& path, cudaStream_t stream = nullptr);
-
-    /// Phase 1: mmap + parse header + populate pages (CPU only, no CUDA needed).
-    /// Call upload() after CUDA context is ready.
-    /// If populate=false, skips MAP_POPULATE/madvise (fast header-only parse for FP8 path).
-    static Weights prefetch(const std::string& path, bool populate = true);
-
-    /// Phase 1 (embedded): parse header from in-memory data (no mmap, no file).
-    static Weights from_embedded(const uint8_t* data, size_t size);
-
-    /// Phase 2: cudaMalloc + cudaMemcpy from prefetched/embedded data, then assign pointers.
-    void upload(cudaStream_t stream = nullptr);
-
-    /// Phase 2 (FP8 path): cudaMalloc + assign pointers only — no data copy.
-    /// weights_fp8.bin is self-contained and will populate GPU memory via fp8_load.
-    void allocate_only();
-
-    /// Free the GPU allocation.
-    void free();
-
-    /// Get a GPU pointer for a named tensor (nullptr if not found).
-    half* get(const std::string& name) const;
-
-    /// Print diagnostic info.
-    void print_info() const;
-};
+static constexpr uint32_t FP8_WEIGHTS_VERSION = 1;
+static constexpr size_t   FP8_WEIGHTS_HEADER  = 16;  // magic(8) + version(4) + pad(4)
 
 // ---------------------------------------------------------------------------
-// CudaModel — encoder + decoder forward pass using GEMM backend + custom kernels
-// ---------------------------------------------------------------------------
-
 // Model constants
+// ---------------------------------------------------------------------------
+
 static constexpr int D_MODEL    = 1024;
 static constexpr int D_FF       = 4096;
 static constexpr int N_HEADS    = 8;
-static constexpr int HEAD_DIM   = D_MODEL / N_HEADS;  // 128
+static constexpr int HEAD_DIM   = D_MODEL / N_HEADS;
 static constexpr int N_BLOCKS   = 24;
 static constexpr int D_CONV_PW  = 2048;
 static constexpr int CONV_K     = 9;
 static constexpr int SUB_CHANNELS = 256;
-static constexpr int D_PRED     = 640;   // decoder hidden
-static constexpr int N_VOCAB    = 1025;  // vocab size (0..1024)
+static constexpr int D_PRED     = 640;
+static constexpr int N_VOCAB    = 1025;
 static constexpr int D_JOINT    = 640;
-static constexpr int D_OUTPUT   = 1030;  // joint output (vocab + durations)
+static constexpr int D_OUTPUT   = 1030;
+
+// ---------------------------------------------------------------------------
+// Weights struct
+// ---------------------------------------------------------------------------
+
+struct Weights {
+    void* gpu_data = nullptr;
+    size_t gpu_data_size = 0;
+
+    void*          mmap_ptr     = nullptr;
+    size_t         mmap_size    = 0;
+    const uint8_t* embedded_ptr = nullptr;
+
+    struct SubConv {
+        half *weight = nullptr, *bias = nullptr;
+    };
+    SubConv sub_conv[7];
+    half *sub_out_w = nullptr, *sub_out_b = nullptr;
+
+    struct ConformerBlock {
+        half *ff1_ln_w = nullptr, *ff1_ln_b = nullptr;
+        half *ff1_w1   = nullptr;
+        half *ff1_w2   = nullptr;
+
+        half *mhsa_ln_w  = nullptr, *mhsa_ln_b  = nullptr;
+        half *q_w        = nullptr;
+        half *k_w        = nullptr;
+        half *v_w        = nullptr;
+        half *pos_w      = nullptr;
+        half *pos_bias_u = nullptr;
+        half *pos_bias_v = nullptr;
+        half *out_w      = nullptr;
+
+        half *conv_ln_w  = nullptr, *conv_ln_b  = nullptr;
+        half *conv_pw1_w = nullptr;
+        half *conv_dw_w  = nullptr;
+        half *conv_dw_b  = nullptr;
+        half *conv_pw2_w = nullptr;
+
+        half *ff2_ln_w = nullptr, *ff2_ln_b = nullptr;
+        half *ff2_w1   = nullptr;
+        half *ff2_w2   = nullptr;
+
+        half *final_ln_w = nullptr, *final_ln_b = nullptr;
+    } blocks[24];
+
+    half *embed_w    = nullptr;
+    half *lstm0_w_ih = nullptr;
+    half *lstm0_w_hh = nullptr;
+    half *lstm0_bias = nullptr;
+    half *lstm1_w_ih = nullptr;
+    half *lstm1_w_hh = nullptr;
+    half *lstm1_bias = nullptr;
+
+    half *enc_proj_w = nullptr, *enc_proj_b = nullptr;
+    half *dec_proj_w = nullptr, *dec_proj_b = nullptr;
+    half *out_proj_w = nullptr, *out_proj_b = nullptr;
+
+    static Weights prefetch(const std::string& path, bool populate = true);
+    static Weights from_embedded(const uint8_t* data, size_t size);
+    void upload(cudaStream_t stream = nullptr);
+    void allocate_only();
+    void free();
+};
+
+// ---------------------------------------------------------------------------
+// CudaModel — FP8 variant with extra quantization fields
+// ---------------------------------------------------------------------------
 
 struct CudaModel {
     cudaStream_t   stream = nullptr;
-    const Weights* w = nullptr;
+    const Weights* w      = nullptr;
 
-    // Max sequence length (after 8x downsampling)
     int T_max = 0;
 
-    // --- Pre-concatenated QKV weights per block ---
-    half* qkv_w[N_BLOCKS];       // [D_MODEL, 3*D_MODEL] per block
+    half* qkv_w[N_BLOCKS];
+    half* lstm_combined_w[2];
+    half* lstm_combined_bias[2];
+    half* lstm_input;
 
-    // --- Pre-combined LSTM weights (W_ih||W_hh side by side) ---
-    half* lstm_combined_w[2];    // [4*D_PRED, 2*D_PRED] per layer
-    half* lstm_combined_bias[2]; // [4*D_PRED] per layer (b_ih + b_hh pre-added)
-    half* lstm_input;            // [2*D_PRED] runtime concat buffer
-
-    // --- Pooled GPU allocation (single cudaMalloc for all buffers below) ---
     void* gpu_pool = nullptr;
 
-    // --- Encoder buffers (all FP16, carved from gpu_pool) ---
-    float* mel_fp32  = nullptr;  // [128, T_mel] — upload buffer for FP32 mel
-    half* mel_fp16   = nullptr;  // [128, T_mel] — cast from FP32 input
-    half* sub_buf[2];            // subsampling ping-pong, sized for max intermediate
-    half* x          = nullptr;  // [T', D_MODEL] — main encoder activation
-    half* ln_out     = nullptr;  // [T', D_MODEL]
-    half* ff_mid     = nullptr;  // [T', D_FF]
-    half* ff_out     = nullptr;  // [T', D_MODEL]
-    half* qkv        = nullptr;  // [T', 3*D_MODEL] — fused QKV output
-    half* q          = nullptr;  // [N_HEADS, T', HEAD_DIM]
-    half* k          = nullptr;  // [N_HEADS, T', HEAD_DIM]
-    half* v          = nullptr;  // [N_HEADS, T', HEAD_DIM]
-    half* pos_enc    = nullptr;  // [2*T_max-1, D_MODEL]
-    half* pos_proj   = nullptr;  // [2*T_max-1, D_MODEL]
-    half* q_u        = nullptr;  // [N_HEADS, T', HEAD_DIM]
-    half* q_v_buf    = nullptr;  // [N_HEADS, T', HEAD_DIM]
-    half* scores     = nullptr;  // [N_HEADS, T', T']
-    half* pos_scores = nullptr;  // [N_HEADS, T', 2*T'-1]
-    half* attn_out   = nullptr;  // [N_HEADS, T', HEAD_DIM]
-    half* mhsa_out   = nullptr;  // [T', D_MODEL]
-    half* conv_mid   = nullptr;  // [T', D_CONV_PW]
-    half* conv_glu   = nullptr;  // [T', D_MODEL]
-    half* conv_dw    = nullptr;  // [T', D_MODEL]
+    float* mel_fp32    = nullptr;
+    half*  mel_fp16    = nullptr;
+    half*  sub_buf[2];
+    half*  x           = nullptr;
+    half*  ln_out      = nullptr;
+    half*  ff_mid      = nullptr;
+    half*  ff_out      = nullptr;
+    half*  qkv         = nullptr;
+    half*  q           = nullptr;
+    half*  k           = nullptr;
+    half*  v           = nullptr;
+    half*  pos_enc     = nullptr;
+    half*  pos_proj    = nullptr;
+    half*  q_u         = nullptr;
+    half*  q_v_buf     = nullptr;
+    half*  scores      = nullptr;
+    half*  pos_scores  = nullptr;
+    half*  attn_out    = nullptr;
+    half*  mhsa_out    = nullptr;
+    half*  conv_mid    = nullptr;
+    half*  conv_glu    = nullptr;
+    half*  conv_dw     = nullptr;
 
-    // --- Decoder buffers (FP16) ---
-    half* lstm_gates    = nullptr;  // [4*D_PRED]
-    half* lstm_h[2];                // h state for 2 LSTM layers, each [D_PRED]
-    half* lstm_c[2];                // c state for 2 LSTM layers, each [D_PRED]
-    half* lstm_h_out[2];            // output h state (uncommitted)
-    half* lstm_c_out[2];            // output c state (uncommitted)
-    half* enc_proj_all  = nullptr;  // [T_max, D_JOINT] — precomputed after encoding
-    half* dec_proj_buf  = nullptr;  // [D_JOINT]
-    half* joint_act     = nullptr;  // [D_JOINT]
-    half* joint_out     = nullptr;  // [D_OUTPUT]
-    int*  argmax_out    = nullptr;  // [2] — token, step (for GPU argmax)
+    half* lstm_gates    = nullptr;
+    half* lstm_h[2];
+    half* lstm_c[2];
+    half* lstm_h_out[2];
+    half* lstm_c_out[2];
+    half* enc_proj_all  = nullptr;
+    half* dec_proj_buf  = nullptr;
+    half* joint_act     = nullptr;
+    half* joint_out     = nullptr;
+    int*  argmax_out    = nullptr;
 
+    // FP8 quantization data
+    static constexpr int N_FP8_SCALES    = N_BLOCKS * 9 + 6;   // 222
+    static constexpr int N_FP8_ACT_SITES = N_BLOCKS * 9 + 2;   // 218
 
-    // --- FP8 weight quantization (used by conformer_fp8.cpp) ---
-    static constexpr int N_FP8_SCALES    = N_BLOCKS * 9 + 6;  // 222 (9 per block + sub_out,enc_proj,lstm0,lstm1,dec_proj,out_proj)
-    static constexpr int N_FP8_ACT_SITES = N_BLOCKS * 9 + 2;  // 218
-    void*    fp8_pool             = nullptr;   // single GPU alloc for all FP8 data
-    uint8_t* fp8_qkv_w[N_BLOCKS]  = {};
-    uint8_t* fp8_ff1_w1[N_BLOCKS] = {};
-    uint8_t* fp8_ff1_w2[N_BLOCKS] = {};
-    uint8_t* fp8_ff2_w1[N_BLOCKS] = {};
-    uint8_t* fp8_ff2_w2[N_BLOCKS] = {};
-    uint8_t* fp8_pos_w[N_BLOCKS]  = {};
-    uint8_t* fp8_out_w[N_BLOCKS]  = {};
+    void*    fp8_pool                 = nullptr;
+    uint8_t* fp8_qkv_w[N_BLOCKS]     = {};
+    uint8_t* fp8_ff1_w1[N_BLOCKS]    = {};
+    uint8_t* fp8_ff1_w2[N_BLOCKS]    = {};
+    uint8_t* fp8_ff2_w1[N_BLOCKS]    = {};
+    uint8_t* fp8_ff2_w2[N_BLOCKS]    = {};
+    uint8_t* fp8_pos_w[N_BLOCKS]     = {};
+    uint8_t* fp8_out_w[N_BLOCKS]     = {};
     uint8_t* fp8_conv_pw1_w[N_BLOCKS] = {};
     uint8_t* fp8_conv_pw2_w[N_BLOCKS] = {};
-    uint8_t* fp8_sub_out_w        = nullptr;
-    uint8_t* fp8_enc_proj_w       = nullptr;
-    uint8_t* fp8_lstm_combined_w[2] = {};
-    uint8_t* fp8_dec_proj_w       = nullptr;
-    uint8_t* fp8_out_proj_w       = nullptr;
-    float*   fp8_scales           = nullptr;   // [N_FP8_SCALES] weight scales on GPU
-    float*   fp8_act_site_scales  = nullptr;   // [N_FP8_ACT_SITES] act scales on GPU
-    uint8_t* fp8_act_buf          = nullptr;   // activation quantization scratch
-    int*     fp8_amax_buf         = nullptr;   // absmax scratch (1 int)
-    bool     fp8_calibrated       = false;
-    // cublasLt handle and workspace for FP8 GEMMs
+    uint8_t* fp8_sub_out_w            = nullptr;
+    uint8_t* fp8_enc_proj_w           = nullptr;
+    uint8_t* fp8_lstm_combined_w[2]   = {};
+    uint8_t* fp8_dec_proj_w           = nullptr;
+    uint8_t* fp8_out_proj_w           = nullptr;
+    float*   fp8_scales               = nullptr;  // [N_FP8_SCALES]
+    float*   fp8_act_site_scales      = nullptr;  // [N_FP8_ACT_SITES]
+    uint8_t* fp8_act_buf              = nullptr;
+    int*     fp8_amax_buf             = nullptr;
+    bool     fp8_calibrated           = false;
+
     cublasHandle_t   cublas            = nullptr;
     cublasLtHandle_t cublaslt          = nullptr;
     void*            lt_workspace      = nullptr;
     size_t           lt_workspace_size = 0;
 
-    // --- Methods ---
-    void init(const Weights& weights, cudaStream_t s, int max_mel_frames);
+    /// fp8_path: path to weights_fp8.bin (load if exists, save after quantization).
+    /// Pass "embedded" when weights_fp8.bin is compiled in (EMBEDDED_WEIGHTS build).
+    void init(const Weights& weights, cudaStream_t s, int max_mel_frames,
+              const char* fp8_path = nullptr);
     void free();
 
-    /// Run encoder: mel FP32 [128, T_mel] → encoder output [T', D_MODEL] in this->x
-    /// Returns T' (number of encoder frames after 8x downsampling).
-    int encode(const float* mel_fp32, int T_mel);
-
-    /// Run encoder from mel_fp32 already on GPU (skip host→device upload).
-    /// mel_fp32 member must be pre-populated with [128, T_mel] float data.
-    int encode_gpu(int T_mel);
-
-    /// Reset decoder LSTM states to zero (call before greedy decode loop).
-    void decoder_reset();
-
-    /// Run one decoder step: given encoder frame index t and previous token,
-    /// produce joint output logits. Returns pointer to D_OUTPUT FP16 values on GPU.
-    /// Does NOT commit LSTM state — call decoder_commit() if token is non-blank.
+    int   encode_gpu(int T_mel);
+    void  decoder_reset();
     half* decode_step(int enc_frame_idx, int prev_token);
-
-    /// Commit LSTM state after a non-blank token emission.
-    void decoder_commit();
+    void  decoder_commit();
 };
 
 #endif  // CONFORMER_H_

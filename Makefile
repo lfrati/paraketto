@@ -124,6 +124,10 @@ weights_fp8.bin: paraketto.fp8 weights.bin
 
 weights-fp8: weights_fp8.bin
 
+# Convert existing weight files to current format (run once after updating)
+repack: weights.bin
+	uv run python scripts/repack_weights.py
+
 # Static build with embedded weights (single file, only needs NVIDIA driver)
 weights_embedded.o: weights.bin
 	objcopy -I binary -O elf64-x86-64 -B i386:x86-64 \
@@ -142,11 +146,11 @@ paraketto.static: $(CONFORMER_DEPS) src/kernels.o src/cutlass_gemm.o src/cutlass
 		-L$(CUDA_HOME)/lib64 $(CUDA_HOME)/lib64/libcudart_static.a -ldl -lpthread -lrt \
 		-o $@
 
-# FP8 static: embeds weights.bin (FP16) + weights_fp8.bin (quantized cache) — no runtime files needed
-paraketto.fp8.static: src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o weights_embedded.o weights_fp8_embedded.o $(SHARED_HEADERS) src/conformer_fp8.h
+# FP8 static: embeds only weights_fp8.bin — no weights.bin needed at runtime
+paraketto.fp8.static: src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o weights_fp8_embedded.o $(SHARED_HEADERS) src/conformer_fp8.h
 	$(CXX) $(CUDA_CXXFLAGS) -DEMBEDDED_WEIGHTS -include src/conformer_fp8.h \
 		src/paraketto_cuda.cpp src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o \
-		weights_embedded.o weights_fp8_embedded.o \
+		weights_fp8_embedded.o \
 		-static-libstdc++ -static-libgcc \
 		-L$(CUDA_HOME)/lib64 $(CUDA_HOME)/lib64/libcudart_static.a -ldl -lpthread -lrt \
 		-lcublas -lcublasLt \

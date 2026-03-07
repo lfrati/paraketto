@@ -16,6 +16,9 @@
 #include <cublas_v2.h>
 #include <cublasLt.h>
 
+#include <unordered_map>
+#include <vector>
+
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -49,7 +52,8 @@ extern "C" {
 // CudaModel::init
 // ---------------------------------------------------------------------------
 
-void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames) {
+void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
+                     const char* fp8_path) {
     w = &weights;
     stream = s;
     T_max = max_mel_frames / 8 + 10;  // encoder frames after 8x downsampling
@@ -180,52 +184,7 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
     argmax_out = (int*)pool;
     pool += 2 * sizeof(int);
 
-    // Pre-concatenate QKV weights using cudaMemcpy2D (72 calls vs 73K row-by-row)
-    for (int b = 0; b < N_BLOCKS; b++) {
-        size_t dst_pitch = 3 * D_MODEL * sizeof(half);
-        size_t src_pitch = D_MODEL * sizeof(half);
-        size_t width = D_MODEL * sizeof(half);
-        CUDA_CHECK(cudaMemcpy2DAsync(
-            qkv_w[b], dst_pitch,
-            weights.blocks[b].q_w, src_pitch,
-            width, D_MODEL, cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpy2DAsync(
-            qkv_w[b] + D_MODEL, dst_pitch,
-            weights.blocks[b].k_w, src_pitch,
-            width, D_MODEL, cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpy2DAsync(
-            qkv_w[b] + 2 * D_MODEL, dst_pitch,
-            weights.blocks[b].v_w, src_pitch,
-            width, D_MODEL, cudaMemcpyDeviceToDevice, stream));
-    }
-
-    // Pre-combine LSTM weights: W_combined[4*D, 2*D] = [W_ih | W_hh] per layer
-    // Same cudaMemcpy2D pattern as QKV concatenation above.
-    {
-        const half* w_ih[2] = { weights.lstm0_w_ih, weights.lstm1_w_ih };
-        const half* w_hh[2] = { weights.lstm0_w_hh, weights.lstm1_w_hh };
-        const half* bias[2] = { weights.lstm0_bias, weights.lstm1_bias };
-        size_t dst_pitch = 2 * D_PRED * sizeof(half);
-        size_t src_pitch = D_PRED * sizeof(half);
-        size_t width = D_PRED * sizeof(half);
-        for (int layer = 0; layer < 2; layer++) {
-            // Left half: W_ih
-            CUDA_CHECK(cudaMemcpy2DAsync(
-                lstm_combined_w[layer], dst_pitch,
-                w_ih[layer], src_pitch,
-                width, 4 * D_PRED, cudaMemcpyDeviceToDevice, stream));
-            // Right half: W_hh
-            CUDA_CHECK(cudaMemcpy2DAsync(
-                lstm_combined_w[layer] + D_PRED, dst_pitch,
-                w_hh[layer], src_pitch,
-                width, 4 * D_PRED, cudaMemcpyDeviceToDevice, stream));
-            // Pre-add biases: combined_bias = b_ih + b_hh
-            residual_add_fp16(bias[layer], bias[layer] + 4 * D_PRED,
-                              lstm_combined_bias[layer], 4 * D_PRED, 1.0f, stream);
-        }
-    }
-
-    // Pre-compute position encoding for T_max (reused via offset for any T <= T_max)
+    // Pre-compute position encoding for T_max (always needed, no FP16 dependency)
     generate_pos_encoding_gpu(pos_enc, T_max, D_MODEL, stream);
 
     // -----------------------------------------------------------------------
@@ -303,80 +262,81 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
 
 
         // ---------------------------------------------------------------------------
-        // FP8 cache save/load — weights_fp8.bin is self-contained:
-        //   "PRKTFP8\0" + uint64 pool_size + uint32 n_scales + uint32 pad   (24B header)
-        //   [fp8_pool blob: all FP8 GEMM weights + scales, pool layout]
-        //   [non-GEMM FP16 blob: LN, biases, conv_dw, embed — packed, fixed order]
+        // FP8 weight cache — weights_fp8.bin format:
+        //   char[8]  magic   = "PRKTFP8\0"
+        //   uint32   version = FP8_WEIGHTS_VERSION (1)
+        //   uint32   pad     = 0
+        //   [fp8_pool blob: FP8 weights + scales, pool layout, single cudaMemcpy]
+        //   [non-GEMM FP16 blob: LN, biases, conv_dw, embed, LSTM, decoder — packed]
+        //
+        // pool_weights_size is computed from the allocation above — no need to store it.
+        // Try fp8_load first; if it fails, quantize from FP16 and save.
         // ---------------------------------------------------------------------------
 
-        // Compute pool weights size once (fp8_pool through end of fp8_scales)
+        // Compute pool blob size (fp8_pool through end of fp8_scales, at their aligned offsets)
         size_t pool_weights_size = (size_t)((char*)(fp8_scales + N_FP8_SCALES) - (char*)fp8_pool);
 
         auto fp8_save = [&](const char* path) {
             CUDA_CHECK(cudaStreamSynchronize(stream));
 
-            // Part 1: fp8_pool blob (single download — pool layout includes alignment gaps)
+            // Part 1: fp8_pool blob (single download — preserves aligned pool layout)
             std::vector<uint8_t> pool_buf(pool_weights_size);
-            CUDA_CHECK(cudaMemcpy(pool_buf.data(), fp8_pool, pool_weights_size, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(pool_buf.data(), fp8_pool, pool_weights_size,
+                                   cudaMemcpyDeviceToHost));
 
-            // Part 2: non-GEMM FP16 weights (all remaining weights needed at runtime)
+            // Part 2: non-GEMM FP16 weights (packed, no alignment gaps)
             std::vector<half> fp16_buf;
             auto save16 = [&](const half* ptr, size_t n) {
                 size_t old = fp16_buf.size();
                 fp16_buf.resize(old + n);
-                CUDA_CHECK(cudaMemcpy(fp16_buf.data() + old, ptr, n * sizeof(half), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(fp16_buf.data() + old, ptr, n * sizeof(half),
+                                       cudaMemcpyDeviceToHost));
             };
-            // Subsampling conv (depthwise + pointwise, but NOT sub_out_w which is FP8)
             for (int i : {0, 2, 3, 5, 6}) {
                 size_t wn = (i == 3 || i == 6) ? (size_t)SUB_CHANNELS * SUB_CHANNELS
-                                                : (size_t)SUB_CHANNELS * 9;
+                                                : SUB_CHANNELS * 9;
                 save16(weights.sub_conv[i].weight, wn);
                 save16(weights.sub_conv[i].bias,   SUB_CHANNELS);
             }
-            save16(weights.sub_out_b, D_MODEL);  // bias for FP8-quantized sub_out_w
-            // Per conformer block
+            save16(weights.sub_out_b, D_MODEL);
             for (int b = 0; b < N_BLOCKS; b++) {
                 auto& blk = weights.blocks[b];
                 save16(blk.ff1_ln_w,   D_MODEL); save16(blk.ff1_ln_b,   D_MODEL);
                 save16(blk.mhsa_ln_w,  D_MODEL); save16(blk.mhsa_ln_b,  D_MODEL);
-                save16(blk.pos_bias_u, N_HEADS * HEAD_DIM);
-                save16(blk.pos_bias_v, N_HEADS * HEAD_DIM);
+                save16(blk.pos_bias_u, (size_t)N_HEADS * HEAD_DIM);
+                save16(blk.pos_bias_v, (size_t)N_HEADS * HEAD_DIM);
                 save16(blk.conv_ln_w,  D_MODEL); save16(blk.conv_ln_b,  D_MODEL);
-                save16(blk.conv_dw_w,  D_MODEL * CONV_K);
+                save16(blk.conv_dw_w,  (size_t)D_MODEL * CONV_K);
                 save16(blk.conv_dw_b,  D_MODEL);
                 save16(blk.ff2_ln_w,   D_MODEL); save16(blk.ff2_ln_b,   D_MODEL);
                 save16(blk.final_ln_w, D_MODEL); save16(blk.final_ln_b, D_MODEL);
             }
-            // Decoder
-            save16(weights.embed_w, N_VOCAB * D_PRED);
-            // LSTM combined weights/biases (FP16 GEMM in decode_step — FP8 N=1 not supported)
-            save16(lstm_combined_w[0],    4 * D_PRED * 2 * D_PRED);
-            save16(lstm_combined_w[1],    4 * D_PRED * 2 * D_PRED);
+            save16(weights.embed_w,       (size_t)N_VOCAB * D_PRED);
+            save16(lstm_combined_w[0],    (size_t)4 * D_PRED * 2 * D_PRED);
+            save16(lstm_combined_w[1],    (size_t)4 * D_PRED * 2 * D_PRED);
             save16(lstm_combined_bias[0], 4 * D_PRED);
             save16(lstm_combined_bias[1], 4 * D_PRED);
-            // Projection weights used as FP16 in decode_step (FP8 N=1 not supported)
-            save16(weights.dec_proj_w, D_PRED  * D_JOINT);
-            save16(weights.out_proj_w, D_JOINT * D_OUTPUT);
-            // Biases
-            save16(weights.enc_proj_b, D_JOINT);
-            save16(weights.dec_proj_b, D_JOINT);
-            save16(weights.out_proj_b, D_OUTPUT);
+            save16(weights.dec_proj_w,    (size_t)D_PRED  * D_JOINT);
+            save16(weights.out_proj_w,    (size_t)D_JOINT * D_OUTPUT);
+            save16(weights.enc_proj_b,    D_JOINT);
+            save16(weights.dec_proj_b,    D_JOINT);
+            save16(weights.out_proj_b,    D_OUTPUT);
 
             FILE* f = fopen(path, "wb");
             if (!f) { fprintf(stderr, "  warning: cannot write %s\n", path); return; }
+
+            // 16-byte header: magic(8) + version(4) + pad(4)
             const char magic[8] = "PRKTFP8";
-            uint64_t pws = pool_weights_size;
-            uint32_t n_scales   = N_FP8_SCALES;
-            uint32_t fp16_bytes = (uint32_t)(fp16_buf.size() * sizeof(half));
-            fwrite(magic,            8,                    1, f);
-            fwrite(&pws,             8,                    1, f);
-            fwrite(&n_scales,        4,                    1, f);
-            fwrite(&fp16_bytes,      4,                    1, f);
-            fwrite(pool_buf.data(),  1,   pool_weights_size, f);
-            fwrite(fp16_buf.data(),  sizeof(half), fp16_buf.size(), f);
+            uint32_t version = FP8_WEIGHTS_VERSION, pad = 0;
+            fwrite(magic,           8, 1, f);
+            fwrite(&version,        4, 1, f);
+            fwrite(&pad,            4, 1, f);
+            fwrite(pool_buf.data(), 1, pool_weights_size, f);
+            fwrite(fp16_buf.data(), sizeof(half), fp16_buf.size(), f);
             fclose(f);
+
             size_t total_mb = (pool_weights_size + fp16_buf.size() * sizeof(half)) / (1024*1024);
-            fprintf(stderr, "  saved FP8 weight cache to %s (%zu MB)\n", path, total_mb);
+            fprintf(stderr, "  saved weights_fp8.bin to %s (%zu MB)\n", path, total_mb);
         };
 
         auto fp8_load = [&](const char* path) -> bool {
@@ -399,26 +359,28 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
             base = (const uint8_t*)mmap_ptr;
 #endif
 
-            // Validate header
-            if (map_size < 24 || memcmp(base, "PRKTFP8", 8) != 0) {
+            // Validate header (16 bytes: magic + version + pad)
+            if (map_size < FP8_WEIGHTS_HEADER
+                    || memcmp(base, "PRKTFP8", 7) != 0) {
                 if (mmap_ptr) munmap(mmap_ptr, map_size);
                 return false;
             }
-            uint64_t pws;         memcpy(&pws,         base + 8,  8);
-            uint32_t n_scales;    memcpy(&n_scales,    base + 16, 4);
-            uint32_t fp16_bytes;  memcpy(&fp16_bytes,  base + 20, 4);
-            if (pws != pool_weights_size || n_scales != (uint32_t)N_FP8_SCALES
-                    || map_size < 24 + pws + fp16_bytes) {
+            uint32_t version; memcpy(&version, base + 8, 4);
+            if (version != FP8_WEIGHTS_VERSION) {
+                if (mmap_ptr) munmap(mmap_ptr, map_size);
+                return false;
+            }
+            if (map_size < FP8_WEIGHTS_HEADER + pool_weights_size) {
                 if (mmap_ptr) munmap(mmap_ptr, map_size);
                 return false;
             }
 
-            // Single cudaMemcpy for entire fp8_pool (FP8 weights + scales at their aligned offsets)
-            CUDA_CHECK(cudaMemcpyAsync(fp8_pool, base + 24, pool_weights_size,
-                                       cudaMemcpyHostToDevice, stream));
+            // Single cudaMemcpy for fp8_pool (FP8 weights + scales at aligned offsets)
+            CUDA_CHECK(cudaMemcpyAsync(fp8_pool, base + FP8_WEIGHTS_HEADER,
+                                       pool_weights_size, cudaMemcpyHostToDevice, stream));
 
             // Non-GEMM FP16 weights — same fixed order as fp8_save
-            const uint8_t* p = base + 24 + pool_weights_size;
+            const uint8_t* p = base + FP8_WEIGHTS_HEADER + pool_weights_size;
             size_t off = 0;
             auto ul16 = [&](half* dst, size_t n) {
                 CUDA_CHECK(cudaMemcpyAsync(dst, p + off, n * sizeof(half),
@@ -427,7 +389,7 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
             };
             for (int i : {0, 2, 3, 5, 6}) {
                 size_t wn = (i == 3 || i == 6) ? (size_t)SUB_CHANNELS * SUB_CHANNELS
-                                                : (size_t)SUB_CHANNELS * 9;
+                                                : SUB_CHANNELS * 9;
                 ul16(weights.sub_conv[i].weight, wn);
                 ul16(weights.sub_conv[i].bias,   SUB_CHANNELS);
             }
@@ -436,58 +398,99 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
                 auto& blk = weights.blocks[b];
                 ul16(blk.ff1_ln_w,   D_MODEL); ul16(blk.ff1_ln_b,   D_MODEL);
                 ul16(blk.mhsa_ln_w,  D_MODEL); ul16(blk.mhsa_ln_b,  D_MODEL);
-                ul16(blk.pos_bias_u, N_HEADS * HEAD_DIM);
-                ul16(blk.pos_bias_v, N_HEADS * HEAD_DIM);
+                ul16(blk.pos_bias_u, (size_t)N_HEADS * HEAD_DIM);
+                ul16(blk.pos_bias_v, (size_t)N_HEADS * HEAD_DIM);
                 ul16(blk.conv_ln_w,  D_MODEL); ul16(blk.conv_ln_b,  D_MODEL);
-                ul16(blk.conv_dw_w,  D_MODEL * CONV_K);
+                ul16(blk.conv_dw_w,  (size_t)D_MODEL * CONV_K);
                 ul16(blk.conv_dw_b,  D_MODEL);
                 ul16(blk.ff2_ln_w,   D_MODEL); ul16(blk.ff2_ln_b,   D_MODEL);
                 ul16(blk.final_ln_w, D_MODEL); ul16(blk.final_ln_b, D_MODEL);
             }
-            ul16(weights.embed_w, N_VOCAB * D_PRED);
-            ul16(lstm_combined_w[0],    4 * D_PRED * 2 * D_PRED);
-            ul16(lstm_combined_w[1],    4 * D_PRED * 2 * D_PRED);
+            ul16(weights.embed_w,       (size_t)N_VOCAB * D_PRED);
+            ul16(lstm_combined_w[0],    (size_t)4 * D_PRED * 2 * D_PRED);
+            ul16(lstm_combined_w[1],    (size_t)4 * D_PRED * 2 * D_PRED);
             ul16(lstm_combined_bias[0], 4 * D_PRED);
             ul16(lstm_combined_bias[1], 4 * D_PRED);
-            ul16(weights.dec_proj_w, D_PRED  * D_JOINT);
-            ul16(weights.out_proj_w, D_JOINT * D_OUTPUT);
-            ul16(weights.enc_proj_b, D_JOINT);
-            ul16(weights.dec_proj_b, D_JOINT);
-            ul16(weights.out_proj_b, D_OUTPUT);
+            ul16(weights.dec_proj_w,    (size_t)D_PRED  * D_JOINT);
+            ul16(weights.out_proj_w,    (size_t)D_JOINT * D_OUTPUT);
+            ul16(weights.enc_proj_b,    D_JOINT);
+            ul16(weights.dec_proj_b,    D_JOINT);
+            ul16(weights.out_proj_b,    D_OUTPUT);
 
             CUDA_CHECK(cudaStreamSynchronize(stream));
             if (mmap_ptr) munmap(mmap_ptr, map_size);
 
-            size_t total_mb = (pool_weights_size + off) / (1024*1024);
-            fprintf(stderr, "  loaded FP8 weight cache from %s (%zu MB)\n", path, total_mb);
+            size_t total_mb = (pool_weights_size + off) / (1024 * 1024);
+            fprintf(stderr, "  loaded weights_fp8.bin from %s (%zu MB)\n", path, total_mb);
             return true;
         };
 
-        // Try to load cache; quantize and save if missing
-        const char* fp8_cache = "weights_fp8.bin";
-        if (!fp8_load(fp8_cache)) {
-            // Quantize all weight matrices
+        // Try to load FP8 cache first.
+        // If it fails (missing or stale), quantize from FP16 weights and save.
+        bool loaded = fp8_path && fp8_load(fp8_path);
+        if (!loaded) {
+            // Need FP16 weights — concatenate QKV and combine LSTM weights
+            for (int b = 0; b < N_BLOCKS; b++) {
+                size_t dst_pitch = 3 * D_MODEL * sizeof(half);
+                size_t src_pitch = D_MODEL * sizeof(half);
+                size_t width     = D_MODEL * sizeof(half);
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    qkv_w[b],              dst_pitch,
+                    weights.blocks[b].q_w, src_pitch, width, D_MODEL,
+                    cudaMemcpyDeviceToDevice, stream));
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    qkv_w[b] + D_MODEL,    dst_pitch,
+                    weights.blocks[b].k_w, src_pitch, width, D_MODEL,
+                    cudaMemcpyDeviceToDevice, stream));
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    qkv_w[b] + 2 * D_MODEL, dst_pitch,
+                    weights.blocks[b].v_w,  src_pitch, width, D_MODEL,
+                    cudaMemcpyDeviceToDevice, stream));
+            }
+            {
+                const half* w_ih[2] = { weights.lstm0_w_ih, weights.lstm1_w_ih };
+                const half* w_hh[2] = { weights.lstm0_w_hh, weights.lstm1_w_hh };
+                const half* bias[2] = { weights.lstm0_bias,  weights.lstm1_bias  };
+                size_t dst_pitch = 2 * D_PRED * sizeof(half);
+                size_t src_pitch =     D_PRED * sizeof(half);
+                size_t width     =     D_PRED * sizeof(half);
+                for (int layer = 0; layer < 2; layer++) {
+                    CUDA_CHECK(cudaMemcpy2DAsync(
+                        lstm_combined_w[layer],          dst_pitch,
+                        w_ih[layer], src_pitch, width, 4 * D_PRED,
+                        cudaMemcpyDeviceToDevice, stream));
+                    CUDA_CHECK(cudaMemcpy2DAsync(
+                        lstm_combined_w[layer] + D_PRED, dst_pitch,
+                        w_hh[layer], src_pitch, width, 4 * D_PRED,
+                        cudaMemcpyDeviceToDevice, stream));
+                    residual_add_fp16(bias[layer], bias[layer] + 4 * D_PRED,
+                                      lstm_combined_bias[layer], 4 * D_PRED, 1.0f, stream);
+                }
+            }
+
+            // Quantize FP16 → FP8
             int si = 0;
             for (int b = 0; b < N_BLOCKS; b++) {
                 auto& blk = weights.blocks[b];
-                quantize_absmax_fp16_to_fp8(qkv_w[b],        fp8_qkv_w[b],      &fp8_scales[si++], D_MODEL * 3 * D_MODEL, fp8_amax_buf, stream);
-                quantize_absmax_fp16_to_fp8(blk.ff1_w1,      fp8_ff1_w1[b],     &fp8_scales[si++], D_MODEL * D_FF,        fp8_amax_buf, stream);
-                quantize_absmax_fp16_to_fp8(blk.ff1_w2,      fp8_ff1_w2[b],     &fp8_scales[si++], D_FF * D_MODEL,        fp8_amax_buf, stream);
-                quantize_absmax_fp16_to_fp8(blk.ff2_w1,      fp8_ff2_w1[b],     &fp8_scales[si++], D_MODEL * D_FF,        fp8_amax_buf, stream);
-                quantize_absmax_fp16_to_fp8(blk.ff2_w2,      fp8_ff2_w2[b],     &fp8_scales[si++], D_FF * D_MODEL,        fp8_amax_buf, stream);
-                quantize_absmax_fp16_to_fp8(blk.pos_w,       fp8_pos_w[b],      &fp8_scales[si++], D_MODEL * D_MODEL,     fp8_amax_buf, stream);
-                quantize_absmax_fp16_to_fp8(blk.out_w,       fp8_out_w[b],      &fp8_scales[si++], D_MODEL * D_MODEL,     fp8_amax_buf, stream);
-                quantize_absmax_fp16_to_fp8(blk.conv_pw1_w,  fp8_conv_pw1_w[b], &fp8_scales[si++], D_CONV_PW * D_MODEL,   fp8_amax_buf, stream);
-                quantize_absmax_fp16_to_fp8(blk.conv_pw2_w,  fp8_conv_pw2_w[b], &fp8_scales[si++], D_MODEL * D_MODEL,     fp8_amax_buf, stream);
+                quantize_absmax_fp16_to_fp8(qkv_w[b],       fp8_qkv_w[b],       &fp8_scales[si++], (size_t)D_MODEL * 3 * D_MODEL, fp8_amax_buf, stream);
+                quantize_absmax_fp16_to_fp8(blk.ff1_w1,     fp8_ff1_w1[b],      &fp8_scales[si++], (size_t)D_MODEL * D_FF,        fp8_amax_buf, stream);
+                quantize_absmax_fp16_to_fp8(blk.ff1_w2,     fp8_ff1_w2[b],      &fp8_scales[si++], (size_t)D_FF   * D_MODEL,      fp8_amax_buf, stream);
+                quantize_absmax_fp16_to_fp8(blk.ff2_w1,     fp8_ff2_w1[b],      &fp8_scales[si++], (size_t)D_MODEL * D_FF,        fp8_amax_buf, stream);
+                quantize_absmax_fp16_to_fp8(blk.ff2_w2,     fp8_ff2_w2[b],      &fp8_scales[si++], (size_t)D_FF   * D_MODEL,      fp8_amax_buf, stream);
+                quantize_absmax_fp16_to_fp8(blk.pos_w,      fp8_pos_w[b],       &fp8_scales[si++], (size_t)D_MODEL * D_MODEL,     fp8_amax_buf, stream);
+                quantize_absmax_fp16_to_fp8(blk.out_w,      fp8_out_w[b],       &fp8_scales[si++], (size_t)D_MODEL * D_MODEL,     fp8_amax_buf, stream);
+                quantize_absmax_fp16_to_fp8(blk.conv_pw1_w, fp8_conv_pw1_w[b],  &fp8_scales[si++], (size_t)D_CONV_PW * D_MODEL,   fp8_amax_buf, stream);
+                quantize_absmax_fp16_to_fp8(blk.conv_pw2_w, fp8_conv_pw2_w[b],  &fp8_scales[si++], (size_t)D_MODEL * D_MODEL,     fp8_amax_buf, stream);
             }
-            quantize_absmax_fp16_to_fp8(weights.sub_out_w,   fp8_sub_out_w,     &fp8_scales[si++], SUB_CHANNELS * 16 * D_MODEL, fp8_amax_buf, stream);
-            quantize_absmax_fp16_to_fp8(weights.enc_proj_w,  fp8_enc_proj_w,    &fp8_scales[si++], D_MODEL * D_JOINT,           fp8_amax_buf, stream);
-            quantize_absmax_fp16_to_fp8(lstm_combined_w[0],  fp8_lstm_combined_w[0], &fp8_scales[si++], 4 * D_PRED * 2 * D_PRED, fp8_amax_buf, stream);
-            quantize_absmax_fp16_to_fp8(lstm_combined_w[1],  fp8_lstm_combined_w[1], &fp8_scales[si++], 4 * D_PRED * 2 * D_PRED, fp8_amax_buf, stream);
-            quantize_absmax_fp16_to_fp8(weights.dec_proj_w,  fp8_dec_proj_w,    &fp8_scales[si++], D_PRED * D_JOINT,            fp8_amax_buf, stream);
-            quantize_absmax_fp16_to_fp8(weights.out_proj_w,  fp8_out_proj_w,    &fp8_scales[si++], D_JOINT * D_OUTPUT,          fp8_amax_buf, stream);
+            quantize_absmax_fp16_to_fp8(weights.sub_out_w,  fp8_sub_out_w,  &fp8_scales[si++], (size_t)SUB_CHANNELS * 16 * D_MODEL, fp8_amax_buf, stream);
+            quantize_absmax_fp16_to_fp8(weights.enc_proj_w, fp8_enc_proj_w, &fp8_scales[si++], (size_t)D_MODEL * D_JOINT,           fp8_amax_buf, stream);
+            quantize_absmax_fp16_to_fp8(lstm_combined_w[0], fp8_lstm_combined_w[0], &fp8_scales[si++], (size_t)4 * D_PRED * 2 * D_PRED, fp8_amax_buf, stream);
+            quantize_absmax_fp16_to_fp8(lstm_combined_w[1], fp8_lstm_combined_w[1], &fp8_scales[si++], (size_t)4 * D_PRED * 2 * D_PRED, fp8_amax_buf, stream);
+            quantize_absmax_fp16_to_fp8(weights.dec_proj_w, fp8_dec_proj_w, &fp8_scales[si++], (size_t)D_PRED  * D_JOINT,           fp8_amax_buf, stream);
+            quantize_absmax_fp16_to_fp8(weights.out_proj_w, fp8_out_proj_w, &fp8_scales[si++], (size_t)D_JOINT * D_OUTPUT,          fp8_amax_buf, stream);
             assert(si == N_FP8_SCALES);
-            fp8_save(fp8_cache);
+
+            if (fp8_path) fp8_save(fp8_path);
         }
     }
 
@@ -891,17 +894,6 @@ static void batched_gemm_nt(cublasHandle_t h,
 }
 
 // Position encoding generation moved to GPU kernel (generate_pos_encoding_gpu)
-
-// ---------------------------------------------------------------------------
-// CudaModel::encode
-// ---------------------------------------------------------------------------
-
-int CudaModel::encode(const float* mel_fp32_host, int T_mel) {
-    // Upload mel from host then delegate to encode_gpu
-    CUDA_CHECK(cudaMemcpyAsync(mel_fp32, mel_fp32_host, 128 * T_mel * sizeof(float),
-                                cudaMemcpyHostToDevice, stream));
-    return encode_gpu(T_mel);
-}
 
 int CudaModel::encode_gpu(int T_mel) {
     // Local FP16 GEMM helpers (kept for small sub-conv GEMMs and batched GEMMs)
