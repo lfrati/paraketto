@@ -2,7 +2,8 @@
 //
 // Instantiates SM80 TensorOp templates benchmarked against cuBLAS for
 // every GEMM shape in parakeet. Configs match or beat cuBLAS on all
-// shapes except FF1 linear2 (1024x63x4096) split-K where cuBLAS is 20% faster.
+// shapes except: FF linear2 T≤64 (-20%), T=257-279 (-8.5%, cuBLAS uses
+// 256x64 split-K with GemmIdentitySwizzle which CUTLASS 2.x can't replicate).
 //
 // Build: nvcc -std=c++17 -arch=sm_80 -O3 -I../third_party/cutlass/include \
 //        --expt-relaxed-constexpr -c cutlass_gemm.cu -o cutlass_gemm.o
@@ -13,6 +14,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm.h"
 #include "cutlass/gemm/device/gemm_batched.h"
+#include "cutlass/gemm/device/gemm_splitk_parallel.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -74,6 +76,68 @@ using GemmNN_64x64_32_s6_a2 = cutlass::gemm::device::Gemm<
     cutlass::gemm::GemmShape<32, 32, 32>,
     cutlass::gemm::GemmShape<16, 8, 16>,
     Epilogue<2>, Swizzle, 6, 2, 8>;
+
+// --- NN split-K parallel (for thin-N, large-K shapes like FF linear2) ---
+
+using GemmSplitKNN_64x64_64_s6 = cutlass::gemm::device::GemmSplitKParallel<
+    cutlass::half_t, cutlass::layout::ColumnMajor,
+    cutlass::half_t, cutlass::layout::ColumnMajor,
+    cutlass::half_t, cutlass::layout::ColumnMajor,
+    cutlass::half_t,
+    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<64, 64, 64>,
+    cutlass::gemm::GemmShape<32, 32, 64>,
+    cutlass::gemm::GemmShape<16, 8, 16>,
+    Epilogue<8>>;
+
+// 128x64 split-K (T=65-128: 12-14% faster than cuBLAS)
+using GemmSplitKNN_128x64_32_s5 = cutlass::gemm::device::GemmSplitKParallel<
+    cutlass::half_t, cutlass::layout::ColumnMajor,
+    cutlass::half_t, cutlass::layout::ColumnMajor,
+    cutlass::half_t, cutlass::layout::ColumnMajor,
+    cutlass::half_t,
+    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128, 64, 32>,
+    cutlass::gemm::GemmShape<64, 32, 32>,
+    cutlass::gemm::GemmShape<16, 8, 16>,
+    Epilogue<8>>;
+
+// --- NN tiles for FF linear2 at medium T ---
+
+using GemmNN_128x64_k32_s5 = cutlass::gemm::device::Gemm<
+    cutlass::half_t, cutlass::layout::ColumnMajor,
+    cutlass::half_t, cutlass::layout::ColumnMajor,
+    cutlass::half_t, cutlass::layout::ColumnMajor,
+    cutlass::half_t,
+    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128, 64, 32>,
+    cutlass::gemm::GemmShape<64, 32, 32>,
+    cutlass::gemm::GemmShape<16, 8, 16>,
+    Epilogue<8>, Swizzle, 5, 8, 8>;
+
+// 64x128 tile (T=241-448: tied or better than 128x64)
+using GemmNN_64x128_k32_s5 = cutlass::gemm::device::Gemm<
+    cutlass::half_t, cutlass::layout::ColumnMajor,
+    cutlass::half_t, cutlass::layout::ColumnMajor,
+    cutlass::half_t, cutlass::layout::ColumnMajor,
+    cutlass::half_t,
+    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<64, 128, 32>,
+    cutlass::gemm::GemmShape<32, 64, 32>,
+    cutlass::gemm::GemmShape<16, 8, 16>,
+    Epilogue<8>, Swizzle, 5, 8, 8>;
+
+// 128x128 split-K (T=449-800: beats cuBLAS by 7-19% with sk=2/3/4)
+using GemmSplitKNN_128x128_32_s5 = cutlass::gemm::device::GemmSplitKParallel<
+    cutlass::half_t, cutlass::layout::ColumnMajor,
+    cutlass::half_t, cutlass::layout::ColumnMajor,
+    cutlass::half_t, cutlass::layout::ColumnMajor,
+    cutlass::half_t,
+    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128, 128, 32>,
+    cutlass::gemm::GemmShape<64, 64, 32>,
+    cutlass::gemm::GemmShape<16, 8, 16>,
+    Epilogue<8>>;
 
 using GemmNN_128x128_32_s5 = cutlass::gemm::device::Gemm<
     cutlass::half_t, cutlass::layout::ColumnMajor,
@@ -162,9 +226,8 @@ static void* s_workspace = nullptr;
 static size_t s_workspace_size = 0;
 
 void cutlass_gemm_init(cudaStream_t) {
-    // Current configs don't need workspace (no split-K).
-    // Reserve 4MB for future split-K or other needs.
-    s_workspace_size = 4 * 1024 * 1024;
+    // Split-K workspace: 128x128 tile, sk=4, T=800: 1024*800*2*4 = 6.5MB. 32MB is safe.
+    s_workspace_size = 32 * 1024 * 1024;
     CUDA_CHECK(cudaMalloc(&s_workspace, s_workspace_size));
 }
 
@@ -214,6 +277,50 @@ static void run_gemm(int M, int N, int K,
     status = op(stream);
     if (status != cutlass::Status::kSuccess) {
         fprintf(stderr, "CUTLASS run failed for %dx%dx%d: %d\n", M, N, K, (int)status);
+        exit(1);
+    }
+}
+
+// =========================================================================
+// Generic CUTLASS split-K parallel GEMM runner
+// =========================================================================
+
+template<typename SplitKGemmOp>
+static void run_splitk_gemm(int M, int N, int K,
+                             const half* A, int ldA,
+                             const half* B, int ldB,
+                             half* C, int ldC,
+                             int split_k_slices,
+                             half alpha, half beta,
+                             cudaStream_t stream) {
+    using ElementA = cutlass::half_t;
+    using ElementC = cutlass::half_t;
+
+    typename SplitKGemmOp::Arguments args(
+        {M, N, K},
+        {reinterpret_cast<const ElementA*>(A), ldA},
+        {reinterpret_cast<const ElementA*>(B), ldB},
+        {reinterpret_cast<ElementC*>(C), ldC},
+        {reinterpret_cast<ElementC*>(C), ldC},
+        {*reinterpret_cast<ElementC*>(&alpha), *reinterpret_cast<ElementC*>(&beta)},
+        split_k_slices
+    );
+
+    SplitKGemmOp op;
+    size_t ws_size = SplitKGemmOp::get_workspace_size(args);
+    void* ws = (ws_size > 0 && ws_size <= s_workspace_size) ? s_workspace : nullptr;
+
+    auto status = op.initialize(args, ws);
+    if (status != cutlass::Status::kSuccess) {
+        fprintf(stderr, "CUTLASS split-K initialize failed for %dx%dx%d sk=%d: %d\n",
+                M, N, K, split_k_slices, (int)status);
+        exit(1);
+    }
+
+    status = op.run(stream);
+    if (status != cutlass::Status::kSuccess) {
+        fprintf(stderr, "CUTLASS split-K run failed for %dx%dx%d sk=%d: %d\n",
+                M, N, K, split_k_slices, (int)status);
         exit(1);
     }
 }
@@ -293,7 +400,17 @@ static void nn_dispatch(cudaStream_t stream,
     //   640x1x640    (dec proj)   → 64x64_32_s3   (33% faster)
     //   4000x256x256 (sub conv.3) → 128x128_32_s5
     //   1030x1x640   (out proj)   → 64x64_32_s6_a2 (align2 for non-8-aligned M)
-    //   Everything else            → 64x64_64_s6   (default, matched cuBLAS)
+    //   FF linear2 (1024×T×4096, 48 calls/utterance):
+    //     T≤64   → 64x64_sk4   (-20% vs cuBLAS; cuBLAS wins here)
+    //     T≤128  → 128x64_sk4  (-14% vs cuBLAS; actually BEATS cuBLAS)
+    //     T≤192  → 64x64_s6    (-11% vs cuBLAS; beats)
+    //     T≤256  → 128x64_sk4  (ties cuBLAS at 20.5us)
+    //     T≤448  → 64x128_s5   (ties cuBLAS T≥280; -8.5% at T=257-279)
+    //     T≤512  → 128x128_sk2 (beats cuBLAS by 7%)
+    //     T≤640  → 128x128_sk3 (beats cuBLAS by 9%)
+    //     T≤800  → 128x128_sk4 (beats cuBLAS by 12-19%)
+    //     T>800  → 128x128_s5  (matched cuBLAS)
+    //   Everything else → 64x64_64_s6 (default, matched cuBLAS)
 
     if (col_m % 8 != 0) {
         // Non-8-aligned M (out_proj 1030x1x640): align2 config
@@ -306,6 +423,33 @@ static void nn_dispatch(cudaStream_t stream,
         run_gemm<GemmNN_64x64_32_s3>(col_m, col_n, col_k, W, ldA, X, ldB, Y, ldC, alpha, beta, stream);
     } else if (col_m >= 2048 && col_n >= 128) {
         // Large subsampling (4000x256x256): big tiles
+        run_gemm<GemmNN_128x128_32_s5>(col_m, col_n, col_k, W, ldA, X, ldB, Y, ldC, alpha, beta, stream);
+    } else if (col_k >= 4096 && col_n <= 64) {
+        // FF linear2 T≤64: split-K sk=4 with 64x64 tile (-20% vs cuBLAS)
+        run_splitk_gemm<GemmSplitKNN_64x64_64_s6>(col_m, col_n, col_k, W, ldA, X, ldB, Y, ldC, 4, alpha, beta, stream);
+    } else if (col_k >= 4096 && col_n <= 128) {
+        // FF linear2 T=65-128: split-K sk=4 with 128x64 tile (-14% vs cuBLAS)
+        run_splitk_gemm<GemmSplitKNN_128x64_32_s5>(col_m, col_n, col_k, W, ldA, X, ldB, Y, ldC, 4, alpha, beta, stream);
+    } else if (col_k >= 4096 && col_n <= 192) {
+        // FF linear2 T=129-192: 64x64 default (-11% vs cuBLAS)
+        run_gemm<GemmNN_64x64_64_s6>(col_m, col_n, col_k, W, ldA, X, ldB, Y, ldC, alpha, beta, stream);
+    } else if (col_k >= 4096 && col_n <= 256) {
+        // FF linear2 T=193-256: 128x64 split-K sk=4 (ties cuBLAS at 20.5us)
+        run_splitk_gemm<GemmSplitKNN_128x64_32_s5>(col_m, col_n, col_k, W, ldA, X, ldB, Y, ldC, 4, alpha, beta, stream);
+    } else if (col_k >= 4096 && col_n <= 448) {
+        // FF linear2 T=257-448: 64x128 tile (ties cuBLAS at T>=280, 8.5% slower T=257-279)
+        run_gemm<GemmNN_64x128_k32_s5>(col_m, col_n, col_k, W, ldA, X, ldB, Y, ldC, alpha, beta, stream);
+    } else if (col_k >= 4096 && col_n <= 512) {
+        // FF linear2 T=449-512: 128x128 sk=2 (-7% vs cuBLAS)
+        run_splitk_gemm<GemmSplitKNN_128x128_32_s5>(col_m, col_n, col_k, W, ldA, X, ldB, Y, ldC, 2, alpha, beta, stream);
+    } else if (col_k >= 4096 && col_n <= 640) {
+        // FF linear2 T=513-640: 128x128 sk=3 (-9% vs cuBLAS)
+        run_splitk_gemm<GemmSplitKNN_128x128_32_s5>(col_m, col_n, col_k, W, ldA, X, ldB, Y, ldC, 3, alpha, beta, stream);
+    } else if (col_k >= 4096 && col_n <= 800) {
+        // FF linear2 T=641-800: 128x128 sk=4 (-12-19% vs cuBLAS)
+        run_splitk_gemm<GemmSplitKNN_128x128_32_s5>(col_m, col_n, col_k, W, ldA, X, ldB, Y, ldC, 4, alpha, beta, stream);
+    } else if (col_k >= 4096) {
+        // FF linear2 T>800: 128x128 regular (matched cuBLAS)
         run_gemm<GemmNN_128x128_32_s5>(col_m, col_n, col_k, W, ldA, X, ldB, Y, ldC, alpha, beta, stream);
     } else {
         // Default: 64x64 tile, K=64, 6 stages (matched cuBLAS everywhere else)
