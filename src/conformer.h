@@ -280,13 +280,6 @@ struct CudaModel {
     float* fp8_act_site_scales = nullptr;  // [N_FP8_ACT_SITES] on GPU
     bool fp8_calibrated = false;
 
-    // --- CUTLASS FP8 GEMM (used after calibration) ---
-    void* cutlass_workspace = nullptr;
-    size_t cutlass_workspace_size = 0;
-    float host_wt_scales[N_FP8_SCALES];
-    float host_act_scales[N_FP8_ACT_SITES];
-    bool cutlass_ready = false;
-
     // --- Methods ---
     void init(const Weights& weights, cudaStream_t s, int max_mel_frames);
     void free();

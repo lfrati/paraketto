@@ -1,12 +1,11 @@
 // conformer.cpp — Weight loading + FP8 inference for CUDA backend
 //
-// FP8 E4M3 weight quantization at init time, FP8 GEMMs via CUTLASS.
+// FP8 E4M3 weight quantization at init time, FP8 GEMMs via cublasLt.
 
 #include "conformer.h"
 #include "common.h"
 #include "kernels.h"
 #include "kernels_fp8.h"
-#include "cutlass_gemm.h"
 
 #include <cassert>
 #include <cmath>
@@ -603,15 +602,6 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
     }
 
     // Allocate CUTLASS workspace (queried for max GEMM size)
-    cutlass_workspace_size = cutlass_fp8_workspace_size(
-        std::max(T_max, 2 * T_max),  // pos_enc has M = 2*T-1
-        D_FF,     // max N
-        D_FF);    // max K (ff2 has K=D_FF=4096)
-    if (cutlass_workspace_size > 0) {
-        CUDA_CHECK(cudaMalloc(&cutlass_workspace, cutlass_workspace_size));
-    }
-    fprintf(stderr, "  CUTLASS workspace: %zu bytes\n", cutlass_workspace_size);
-
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
@@ -681,7 +671,7 @@ void CudaModel::free() {
     }
     fp8_gemm_cache.clear();
     if (lt_workspace) { cudaFree(lt_workspace); lt_workspace = nullptr; }
-    if (cutlass_workspace) { cudaFree(cutlass_workspace); cutlass_workspace = nullptr; }
+
     // All inference buffers are carved from a single pooled allocation
     if (gpu_pool) { cudaFree(gpu_pool); gpu_pool = nullptr; }
     if (fp8_pool) { cudaFree(fp8_pool); fp8_pool = nullptr; }
@@ -1029,53 +1019,26 @@ int CudaModel::encode_gpu(int T_mel) {
         gemm_nn(cublaslt, cublas, lt_workspace, lt_workspace_size, stream, X, m, k, W, n, Y);
     };
 
-    // Local FP8 GEMM helpers — dispatch to CUTLASS when ready, cublasLt for calibration
+    // Local FP8 GEMM helpers — cublasLt FP8 with per-site cached activation scales
     bool cal = fp8_calibrated;
-    bool use_cutlass = cutlass_ready;
-
-    // CUTLASS helper: quantize activation, compute alpha, call CUTLASS GEMM
-    auto cutlass_gnn = [&](const half* X, int m, int k, const uint8_t* W, int n,
-                            int wsi, int asi, half* Y) {
-        quantize_fp8_static(X, fp8_act_buf, &fp8_act_site_scales[asi], m * k, stream);
-        float alpha = host_act_scales[asi] * host_wt_scales[wsi];
-        cutlass_fp8_gemm(m, n, k, fp8_act_buf, W, Y, alpha, stream,
-                         cutlass_workspace, cutlass_workspace_size);
-    };
 
     auto gnn8 = [&](const half* X, int m, int k, const uint8_t* W, int n,
                      const float* ws, int si, half* Y) {
-        if (use_cutlass) {
-            int wsi = (int)(ws - fp8_scales);
-            cutlass_gnn(X, m, k, W, n, wsi, si, Y);
-        } else {
-            gemm_nn_fp8(cublaslt, cublas, lt_workspace, lt_workspace_size, stream,
-                        X, m, k, W, n, ws, Y, fp8_act_buf,
-                        &fp8_act_site_scales[si], fp8_amax_buf, cal);
-        }
+        gemm_nn_fp8(cublaslt, cublas, lt_workspace, lt_workspace_size, stream,
+                    X, m, k, W, n, ws, Y, fp8_act_buf,
+                    &fp8_act_site_scales[si], fp8_amax_buf, cal);
     };
     auto gnn8_bias = [&](const half* X, int m, int k, const uint8_t* W, int n,
                           const float* ws, int si, const half* bias, half* Y) {
-        if (use_cutlass) {
-            int wsi = (int)(ws - fp8_scales);
-            cutlass_gnn(X, m, k, W, n, wsi, si, Y);
-            bias_add_row_fp16(Y, bias, m, n, stream);
-        } else {
-            gemm_nn_bias_fp8(cublaslt, cublas, lt_workspace, lt_workspace_size, stream,
-                             X, m, k, W, n, ws, bias, Y, fp8_act_buf,
-                             &fp8_act_site_scales[si], fp8_amax_buf, cal);
-        }
+        gemm_nn_bias_fp8(cublaslt, cublas, lt_workspace, lt_workspace_size, stream,
+                         X, m, k, W, n, ws, bias, Y, fp8_act_buf,
+                         &fp8_act_site_scales[si], fp8_amax_buf, cal);
     };
     auto gnt8 = [&](const half* X, int m, int k, const uint8_t* W, int n,
                      const float* ws, int si, half* Y) {
-        if (use_cutlass) {
-            // NT weights W[N,K] are already K-contiguous → correct for CUTLASS SM120
-            int wsi = (int)(ws - fp8_scales);
-            cutlass_gnn(X, m, k, W, n, wsi, si, Y);
-        } else {
-            gemm_nt_fp8(cublaslt, cublas, lt_workspace, lt_workspace_size, stream,
-                        X, m, k, W, n, ws, Y, fp8_act_buf,
-                        &fp8_act_site_scales[si], fp8_amax_buf, cal);
-        }
+        gemm_nt_fp8(cublaslt, cublas, lt_workspace, lt_workspace_size, stream,
+                    X, m, k, W, n, ws, Y, fp8_act_buf,
+                    &fp8_act_site_scales[si], fp8_amax_buf, cal);
     };
     // Weight scale helper: fp8_scales[blk * 9 + offset]
     auto bscale = [&](int blk, int off) -> const float* { return &fp8_scales[blk * 9 + off]; };
@@ -1214,49 +1177,6 @@ int CudaModel::encode_gpu(int T_mel) {
     gnn8_bias(x, T, D_MODEL, fp8_enc_proj_w, D_JOINT, enc_proj_scale, enc_proj_si, w->enc_proj_b, enc_proj_all);
 
     fp8_calibrated = true;
-
-    // --- Post-calibration: prepare for CUTLASS dispatch on next call (once only) ---
-    if (cutlass_ready) return T;
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    // Copy weight + activation scales to host (CUTLASS uses host-side alpha = act_scale * wt_scale)
-    CUDA_CHECK(cudaMemcpy(host_wt_scales, fp8_scales,
-                           N_FP8_SCALES * sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(host_act_scales, fp8_act_site_scales,
-                           N_FP8_ACT_SITES * sizeof(float), cudaMemcpyDeviceToHost));
-
-    // Transpose NN weights from [K,N] to [N,K] row-major for CUTLASS SM120.
-    // CUTLASS SM120 TN layout reads B with K-contiguous access regardless of the
-    // ColumnMajor layout spec. So B must be stored as [N,K] row-major (K contiguous).
-    // NN weights W[K,N] → must be transposed to W^T[N,K].
-    // NT weights W[N,K] → already correct (conv_pw1, conv_pw2), no transpose needed.
-    // Use lt_workspace (32MB) as temp — largest matrix is D_MODEL*D_FF = 4MB.
-    for (int blk = 0; blk < N_BLOCKS; blk++) {
-        transpose_u8_inplace(fp8_qkv_w[blk], D_MODEL, 3 * D_MODEL,
-                              lt_workspace, stream);
-        transpose_u8_inplace(fp8_ff1_w1[blk], D_MODEL, D_FF,
-                              lt_workspace, stream);
-        transpose_u8_inplace(fp8_ff1_w2[blk], D_FF, D_MODEL,
-                              lt_workspace, stream);
-        transpose_u8_inplace(fp8_ff2_w1[blk], D_MODEL, D_FF,
-                              lt_workspace, stream);
-        transpose_u8_inplace(fp8_ff2_w2[blk], D_FF, D_MODEL,
-                              lt_workspace, stream);
-        transpose_u8_inplace(fp8_pos_w[blk], D_MODEL, D_MODEL,
-                              lt_workspace, stream);
-        transpose_u8_inplace(fp8_out_w[blk], D_MODEL, D_MODEL,
-                              lt_workspace, stream);
-    }
-    transpose_u8_inplace(fp8_sub_out_w, SUB_CHANNELS * 16, D_MODEL,
-                          lt_workspace, stream);
-    transpose_u8_inplace(fp8_enc_proj_w, D_MODEL, D_JOINT,
-                          lt_workspace, stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    cutlass_ready = true;
-    fprintf(stderr, "  CUTLASS FP8 GEMMs enabled (calibrated + %d NN weights transposed)\n",
-            N_BLOCKS * 7 + 2);
-
     return T;
 }
 

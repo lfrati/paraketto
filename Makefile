@@ -82,8 +82,11 @@ src/kernels_fp8.o: src/kernels_fp8.cu src/kernels_fp8.h
 src/cutlass_gemm.o: src/cutlass_gemm.cu src/cutlass_gemm.h
 	$(NVCC) $(NVFLAGS) -arch=sm_120a $(CUTLASS_INC) -c $< -o $@
 
-paraketto.cuda: src/paraketto_cuda.cpp src/conformer.cpp src/conformer.h src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/kernels.h src/kernels_fp8.h src/cutlass_gemm.h $(SHARED_HEADERS)
-	$(CXX) $(CUDA_CXXFLAGS) src/paraketto_cuda.cpp src/conformer.cpp src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o $(CUDA_LDFLAGS) -o $@
+paraketto.cuda: src/paraketto_cuda.cpp src/conformer.cpp src/conformer.h src/kernels.o src/kernels_fp8.o src/kernels.h src/kernels_fp8.h $(SHARED_HEADERS)
+	$(CXX) $(CUDA_CXXFLAGS) src/paraketto_cuda.cpp src/conformer.cpp src/kernels.o src/kernels_fp8.o $(CUDA_LDFLAGS) -o $@
+
+bench_fp8: tests/bench_fp8.cu src/cutlass_gemm.o src/kernels_fp8.o src/cutlass_gemm.h src/kernels_fp8.h
+	$(NVCC) $(NVFLAGS) -arch=sm_120a $(CUTLASS_INC) tests/bench_fp8.cu src/cutlass_gemm.o src/kernels_fp8.o -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lpthread -o $@
 
 clean:
-	rm -f paraketto paraketto.cuda src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o
+	rm -f paraketto paraketto.cuda bench_fp8 src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o
