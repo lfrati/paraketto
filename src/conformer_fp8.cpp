@@ -53,7 +53,8 @@ extern "C" {
 // ---------------------------------------------------------------------------
 
 void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
-                     const char* fp8_path) {
+                     const char* fp8_path,
+                     const void* fp8_prefetch, size_t fp8_prefetch_size) {
     w = &weights;
     stream = s;
     T_max = max_mel_frames / 8 + 10;  // encoder frames after 8x downsampling
@@ -342,21 +343,27 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
         auto fp8_load = [&](const char* path) -> bool {
             const uint8_t* base = nullptr;
             size_t map_size = 0;
-            void* mmap_ptr = nullptr;
+            void* mmap_ptr = nullptr;  // only set if we did our own mmap (need to munmap)
 
 #ifdef EMBEDDED_WEIGHTS
             base     = _binary_weights_fp8_bin_start;
             map_size = (size_t)(_binary_weights_fp8_bin_end - _binary_weights_fp8_bin_start);
 #else
-            int fd = open(path, O_RDONLY);
-            if (fd < 0) return false;
-            struct stat st; fstat(fd, &st);
-            map_size = (size_t)st.st_size;
-            mmap_ptr = mmap(nullptr, map_size, PROT_READ, MAP_PRIVATE, fd, 0);
-            close(fd);
-            if (mmap_ptr == MAP_FAILED) return false;
-            madvise(mmap_ptr, map_size, MADV_SEQUENTIAL);
-            base = (const uint8_t*)mmap_ptr;
+            if (fp8_prefetch) {
+                // Use pre-populated mapping from background prefetch thread
+                base = (const uint8_t*)fp8_prefetch;
+                map_size = fp8_prefetch_size;
+            } else {
+                int fd = open(path, O_RDONLY);
+                if (fd < 0) return false;
+                struct stat st; fstat(fd, &st);
+                map_size = (size_t)st.st_size;
+                mmap_ptr = mmap(nullptr, map_size, PROT_READ, MAP_PRIVATE, fd, 0);
+                close(fd);
+                if (mmap_ptr == MAP_FAILED) return false;
+                madvise(mmap_ptr, map_size, MADV_SEQUENTIAL);
+                base = (const uint8_t*)mmap_ptr;
+            }
 #endif
 
             // Validate header (16 bytes: magic + version + pad)

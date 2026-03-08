@@ -48,9 +48,12 @@ struct Pipeline {
 
     // fp8_ready: non-empty = weights_fp8.bin exists and is valid (use allocate_only).
     // fp8_target: path to load/save weights_fp8.bin (may differ on first run).
+    // fp8_prefetch: pre-populated mmap of weights_fp8.bin from background thread.
     void init(Weights&& prefetched,
               const std::string& fp8_ready  = "",
-              const std::string& fp8_target = "") {
+              const std::string& fp8_target = "",
+              const void* fp8_prefetch = nullptr,
+              size_t fp8_prefetch_size = 0) {
         CUDA_CHECK(cudaStreamCreate(&stream));
         weights = std::move(prefetched);
 
@@ -67,7 +70,8 @@ struct Pipeline {
 
 #ifdef PARAKETTO_FP8
         const char* fp8_path = fp8_target.empty() ? nullptr : fp8_target.c_str();
-        cuda_model.init(weights, stream, 16000 * 120 / 160, fp8_path);
+        cuda_model.init(weights, stream, 16000 * 120 / 160, fp8_path,
+                        fp8_prefetch, fp8_prefetch_size);
 #else
         cuda_model.init(weights, stream, 16000 * 120 / 160);
 #endif
@@ -213,6 +217,8 @@ int main(int argc, char** argv) {
     // If yes: allocate_only() + fp8_load (skip weights.bin upload).
     // If no:  upload weights.bin FP16, quantize, save weights_fp8.bin.
     std::string fp8_path_for_init;
+    void* fp8_prefetch_ptr = nullptr;
+    size_t fp8_prefetch_size = 0;
 #if defined(PARAKETTO_FP8) && !defined(EMBEDDED_WEIGHTS)
     {
         int fd = open(weights_path.c_str(), O_RDONLY);
@@ -238,14 +244,28 @@ int main(int argc, char** argv) {
         _binary_weights_bin_end - _binary_weights_bin_start);
 #  endif
 #else
-    // Prefetch weights.bin in background while CUDA inits.
-    // FP8 path when fp8 ready: skip MAP_POPULATE (we only need GPU allocation size,
-    // not the actual FP16 data — the FP8 file has everything).
+    // Prefetch in background while CUDA context inits.
     prefetch_thread = std::thread([&]() {
 #  ifdef PARAKETTO_FP8
-        if (fp8_path_for_init.empty())
+        if (fp8_path_for_init.empty()) {
             prefetched = Weights::prefetch(fp16_path);  // need FP16 data for quantization
-        // else: fp8 ready — allocate_only() needs no file data, skip prefetch
+        } else {
+            // Pre-populate FP8 file pages while CUDA init runs
+            int fd = open(fp8_path_for_init.c_str(), O_RDONLY);
+            if (fd >= 0) {
+                struct stat st; fstat(fd, &st);
+                fp8_prefetch_size = (size_t)st.st_size;
+                fp8_prefetch_ptr = mmap(nullptr, st.st_size, PROT_READ,
+                                        MAP_PRIVATE | MAP_POPULATE, fd, 0);
+                close(fd);
+                if (fp8_prefetch_ptr == MAP_FAILED) {
+                    fp8_prefetch_ptr = nullptr;
+                    fp8_prefetch_size = 0;
+                } else {
+                    madvise(fp8_prefetch_ptr, st.st_size, MADV_SEQUENTIAL);
+                }
+            }
+        }
 #  else
         prefetched = Weights::prefetch(weights_path);
 #  endif
@@ -266,11 +286,18 @@ int main(int argc, char** argv) {
 
     Pipeline pipeline;
 #ifdef PARAKETTO_FP8
-    pipeline.init(std::move(prefetched), fp8_path_for_init, weights_path);
+    pipeline.init(std::move(prefetched), fp8_path_for_init, weights_path,
+                  fp8_prefetch_ptr, fp8_prefetch_size);
 #else
     pipeline.init(std::move(prefetched));
 #endif
     auto t_init_done = clk::now();
+
+    // Clean up FP8 prefetch mapping (data is on GPU now)
+    if (fp8_prefetch_ptr) {
+        munmap(fp8_prefetch_ptr, fp8_prefetch_size);
+        fp8_prefetch_ptr = nullptr;
+    }
 
     if (server_mode) {
         // Warmup with 1s of silence

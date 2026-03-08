@@ -205,8 +205,10 @@ struct CudaModel {
 
     /// fp8_path: path to weights_fp8.bin (load if exists, save after quantization).
     /// Pass "embedded" when weights_fp8.bin is compiled in (EMBEDDED_WEIGHTS build).
+    /// fp8_prefetch: pre-populated mmap of weights_fp8.bin (from background prefetch thread).
     void init(const Weights& weights, cudaStream_t s, int max_mel_frames,
-              const char* fp8_path = nullptr);
+              const char* fp8_path = nullptr,
+              const void* fp8_prefetch = nullptr, size_t fp8_prefetch_size = 0);
     void free();
 
     int   encode_gpu(int T_mel);
