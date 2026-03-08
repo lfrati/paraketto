@@ -1,17 +1,10 @@
-PARAKEET_MODEL ?= nemo-parakeet-tdt-0.6b-v2
-VENV_PKGS       = .venv/lib/python3.13/site-packages
-TRT_LIBS        = $(VENV_PKGS)/tensorrt_libs
-TRT_INCLUDE     = third_party/tensorrt
 CUDA_HOME      ?= /usr/local/cuda-13.1
-export LD_LIBRARY_PATH := $(TRT_LIBS):$(VENV_PKGS)/onnxruntime/capi:$(LD_LIBRARY_PATH)
 
 CXX      = g++
 NVCC     = $(CUDA_HOME)/bin/nvcc
-CXXFLAGS = -std=c++17 -O3 -march=native -flto=auto -Wno-deprecated-declarations -I$(TRT_INCLUDE) -I$(CUDA_HOME)/include -Ithird_party -Isrc
 NVFLAGS  = -std=c++17 -O3 -I$(CUDA_HOME)/include -Isrc --expt-relaxed-constexpr
-LDFLAGS  = -flto=auto -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lpthread $(TRT_LIBS)/libnvinfer.so.10 -Wl,-rpath,$(TRT_LIBS)
 
-.PHONY: bench-all bench-py bench-cpp bench-cuda bench-cublas bench-fp8 engines inspect-onnx weights weights-fp8 download-data download-weights clean
+.PHONY: bench-all bench-cuda bench-cublas bench-fp8 weights weights-fp8 download-data download-weights clean
 
 # Download benchmark data from GitHub release
 data/librispeech/manifest.json:
@@ -31,30 +24,15 @@ weights.bin:
 
 download-weights: weights.bin
 
-engines: engines/encoder.engine engines/decoder_joint.engine
-
-engines/encoder.engine engines/decoder_joint.engine: scripts/build_engines.py
-	uv run python scripts/build_engines.py
-
 BENCH_SEP = @printf '\n%s\n%s\n%s\n' '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━' '  $(1)'
 
-bench-all: paraketto engines/encoder.engine engines/decoder_joint.engine paraketto.cuda paraketto.cublas paraketto.fp8 data/librispeech/manifest.json weights.bin
-	$(call BENCH_SEP,Python  ·  ONNX Runtime + TRT EP)
-	@uv run python tests/bench.py
-	$(call BENCH_SEP,C++ TRT ·  paraketto.cpp + TensorRT)
-	@uv run python tests/bench_cpp.py
+bench-all: paraketto.cuda paraketto.cublas paraketto.fp8 data/librispeech/manifest.json weights.bin
 	$(call BENCH_SEP,C++ CUDA · paraketto_cuda.cpp + CUTLASS FP16)
 	@uv run python tests/bench_native.py paraketto.cuda
 	$(call BENCH_SEP,C++ cuBLAS · paraketto_cuda.cpp + cuBLAS FP16)
 	@uv run python tests/bench_native.py paraketto.cublas
 	$(call BENCH_SEP,C++ FP8  · paraketto_cuda.cpp + cublasLt FP8)
 	@uv run python tests/bench_native.py paraketto.fp8
-
-bench-py: data/librispeech/manifest.json
-	uv run python tests/bench.py
-
-bench-cpp: paraketto engines/encoder.engine engines/decoder_joint.engine data/librispeech/manifest.json
-	uv run python tests/bench_cpp.py
 
 bench-cuda: paraketto.cuda data/librispeech/manifest.json weights.bin
 	uv run python tests/bench_native.py paraketto.cuda
@@ -64,10 +42,6 @@ bench-cublas: paraketto.cublas data/librispeech/manifest.json weights.bin
 
 bench-fp8: paraketto.fp8 data/librispeech/manifest.json weights_fp8.bin
 	uv run python tests/bench_native.py paraketto.fp8
-
-# ONNX inspection and weight export
-inspect-onnx:
-	uv run python scripts/inspect_onnx.py
 
 weights: weights.bin
 
@@ -80,10 +54,6 @@ src/kernels.o: src/kernels.cu src/kernels.h
 	$(NVCC) $(NVFLAGS) -arch=sm_120 -c $< -o $@
 
 SHARED_HEADERS = src/common.h src/wav.h src/mel.h src/vocab.h src/server.h
-
-# TRT backend (reference)
-paraketto: src/paraketto.cpp src/kernels.o src/kernels.h $(SHARED_HEADERS)
-	$(CXX) $(CXXFLAGS) src/paraketto.cpp src/kernels.o $(LDFLAGS) -o $@
 
 # Shared CUDA backend flags
 CUDA_CXXFLAGS = -std=c++17 -O3 -march=native -flto=auto -Wno-deprecated-declarations -I$(CUDA_HOME)/include -Ithird_party -Isrc
@@ -172,4 +142,4 @@ bench_ff2: tests/bench_ff2.cu
 	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) tests/bench_ff2.cu -lcublas -lcublasLt -o $@
 
 clean:
-	rm -f paraketto paraketto.cuda paraketto.cublas paraketto.fp8 paraketto.static paraketto.fp8.static src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cublas_gemm.o src/weights.o src/conformer_fp8.o weights_embedded.o weights_fp8_embedded.o
+	rm -f paraketto.cuda paraketto.cublas paraketto.fp8 paraketto.static paraketto.fp8.static src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cublas_gemm.o src/weights.o src/conformer_fp8.o weights_embedded.o weights_fp8_embedded.o

@@ -145,37 +145,6 @@ make bench-fp8     # WER + RTFx (FP8 backend)
 make bench-all     # all backends
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Python  ·  ONNX Runtime + TRT EP
-
-Loading model...
-Model loaded in 2.3s
-
-┌─────────────┬──────────┬─────────┬────────┬─────────┬──────────┐
-│ Dataset     │      WER │    RTFx │   Utts │   Audio │     Time │
-├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
-│ librispeech │    1.68% │    694x │    100 │    896s │    1.29s │
-│ earnings22  │   16.48% │    583x │     40 │    253s │    434ms │
-│ long        │    2.00% │    879x │     50 │   5578s │    6.35s │
-│ difficult   │   23.32% │    801x │     50 │    509s │    635ms │
-├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
-│ Total       │          │    831x │    240 │   7236s │    8.71s │
-└─────────────┴──────────┴─────────┴────────┴─────────┴──────────┘
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  C++ TRT ·  paraketto.cpp + TensorRT
-
-┌─────────────┬──────────┬─────────┬────────┬─────────┬──────────┐
-│ Dataset     │      WER │    RTFx │   Utts │   Audio │     Time │
-├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
-│ librispeech │    1.68% │    946x │    100 │    896s │    947ms │
-│ earnings22  │   16.48% │    836x │     40 │    253s │    303ms │
-│ long        │    1.94% │   1192x │     50 │   5578s │    4.68s │
-│ difficult   │   23.41% │   1079x │     50 │    509s │    472ms │
-├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
-│ Total       │          │   1131x │    240 │   7236s │    6.40s │
-└─────────────┴──────────┴─────────┴────────┴─────────┴──────────┘
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   C++ CUDA · paraketto_cuda.cpp + CUTLASS FP16
 
 ┌─────────────┬──────────┬─────────┬────────┬─────────┬──────────┐
@@ -218,17 +187,6 @@ Model loaded in 2.3s
 └─────────────┴──────────┴─────────┴────────┴─────────┴──────────┘
 ```
 
-## TensorRT backend (reference)
-
-A reference TensorRT backend is also included. Requires TensorRT runtime libraries.
-
-```bash
-make engines                     # build TRT engines from ONNX
-make paraketto                   # compile the TRT binary
-./paraketto audio.wav
-make bench-cpp                   # benchmark
-```
-
 ## Static binary (no runtime files)
 
 ```bash
@@ -252,9 +210,7 @@ src/cublas_gemm.cu        # cuBLAS FP16 backend
 src/kernels.cu            # Custom kernels: FFT, LayerNorm, SiLU, GLU, conv, LSTM, ...
 src/kernels_fp8.cu        # FP8 kernels: absmax quantize, static quantize, transpose
 src/mel.h                 # Custom 512-point FFT + mel filterbank
-src/paraketto.cpp         # TensorRT backend (reference)
 scripts/export_weights.py # NeMo → weights.bin converter
-scripts/build_engines.py  # ONNX → TRT engine builder
 ```
 
 ## References
