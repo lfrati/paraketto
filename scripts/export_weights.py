@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Export ONNX model weights to weights.bin for the CUDA backend.
+"""Export ONNX model weights to paraketto-fp16.bin for the CUDA backend.
 
-weights.bin format:
+paraketto-fp16.bin format:
   uint32  magic   = 0x544B5250  ("PRKT" little-endian)
   uint32  version = 2
   [raw FP16 tensor data, 256-byte aligned, in fixed order matching source layout]
@@ -236,7 +236,7 @@ def export_weights(output_path: Path) -> dict[str, np.ndarray]:
 
 
 def main() -> None:
-    output_path = Path(__file__).resolve().parent.parent / "weights.bin"
+    output_path = Path(__file__).resolve().parent.parent / "paraketto-fp16.bin"
     export_weights(output_path)
     print("\nDone.")
 

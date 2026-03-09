@@ -44,8 +44,8 @@ paraketto.fp8
 third_party/cutlass/
 
 # Model weights (generated or quantized)
-weights.bin
-weights_fp8.bin
+paraketto-fp16.bin
+paraketto-fp8.bin
 
 # Test files
 test.wav

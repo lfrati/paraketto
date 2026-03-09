@@ -582,13 +582,13 @@ The original plan assumed packed QKV [1024→3072], 3 subsampling layers with ba
 #### Results
 
 - **625 tensors** exported (612 encoder + 13 decoder), all verified round-trip
-- **weights.bin**: 1,236 MB FP16 — GPU-agnostic, works on any CUDA device
+- **paraketto-fp16.bin**: 1,236 MB FP16 — GPU-agnostic, works on any CUDA device
 - **Weight loading**: 123ms (vs ~333ms TRT engine deserialization) — **2.7× faster**
 - **Dual backend**: `--backend trt` (default, unchanged) and `--backend cuda` (loads weights, inference stub)
 - TRT path completely unaffected — same binary, same behavior
 
 ```
-$ ./paraketto --backend cuda --weights weights.bin data/librispeech/6930-75918-0000.wav
+$ ./paraketto --backend cuda --weights paraketto-fp16.bin data/librispeech/6930-75918-0000.wav
 weights: 625 tensors, 1178.4 MB GPU
   all key weights mapped successfully
 init: 202ms (weights=123 mel+stream=79 bufs=0)
@@ -662,7 +662,7 @@ After all four fixes, the CUDA backend produces **identical** transcriptions to 
 $ for f in data/librispeech/6930-75918-000{0,1,2,3,4}.wav; do
     echo "$(basename $f):"
     echo "  TRT:  $(./paraketto --backend trt $f 2>/dev/null | tail -1)"
-    echo "  CUDA: $(./paraketto --backend cuda --weights weights.bin $f 2>/dev/null | tail -1)"
+    echo "  CUDA: $(./paraketto --backend cuda --weights paraketto-fp16.bin $f 2>/dev/null | tail -1)"
   done
 
 6930-75918-0000.wav:
@@ -683,7 +683,7 @@ src/kernels.h        # kernel declarations
 src/conformer.h      # Weights struct + CudaModel struct
 src/conformer.cpp    # ~800 lines: weight loading + encoder/decoder forward pass
 src/paraketto.cpp    # Pipeline integration, --backend cuda support
-weights.bin          # 1.2 GB flat binary (GPU-agnostic, no engine rebuilds)
+paraketto-fp16.bin          # 1.2 GB flat binary (GPU-agnostic, no engine rebuilds)
 ```
 
 Link dependencies: `cudart`, `cublas`, `cublasLt`, `cufft`, `cudnn`. cuDNN is used only for flash attention (SDPA) in the encoder.
@@ -752,7 +752,7 @@ Server mode, 81 files (589s audio), RTX 5070 Ti, 5 warmup passes + 3 benchmark r
 
 **CUDA is ~8% slower than TRT** (12.5ms vs 11.5ms). Down from 23% in Step 11, thanks to cuDNN flash attention, cublasLt algorithm caching, and kernel fusion. The remaining ~1ms gap is TRT's Myelin compiler fusing GEMM+residual+LayerNorm chains — not replicable with library calls.
 
-The CUDA backend eliminates ~800MB of TensorRT runtime libraries and GPU-specific engine files, replacing them with a single portable `weights.bin` that works on any CUDA GPU.
+The CUDA backend eliminates ~800MB of TensorRT runtime libraries and GPU-specific engine files, replacing them with a single portable `paraketto-fp16.bin` that works on any CUDA GPU.
 
 ### Step 13: Removing cuDNN, Startup Optimization
 
@@ -1436,14 +1436,14 @@ The unified GEMM interface (`src/gemm.h`) abstracts `gemm_nn`, `gemm_nt`, `gemm_
 
 ### FP8 Weight Cache
 
-Quantizing 216 conformer linear matrices + 6 decoder/projection matrices from FP16 takes ~1s at startup. To avoid this on every run, `paraketto.fp8` automatically saves a `weights_fp8.bin` cache (588 MB) on first run and loads it on subsequent runs:
+Quantizing 216 conformer linear matrices + 6 decoder/projection matrices from FP16 takes ~1s at startup. To avoid this on every run, `paraketto.fp8` automatically saves a `paraketto-fp8.bin` cache (588 MB) on first run and loads it on subsequent runs:
 
 ```
-$ make weights-fp8       # generates weights_fp8.bin once
+$ make weights-fp8       # generates paraketto-fp8.bin once
 $ ./paraketto.fp8 ...    # loads cache: ~400ms vs ~1400ms cold start
 ```
 
-The cache format is a simple flat binary: 16-byte header (`PRKTFP8\0` + version + pad) followed by packed FP8 weight data and float32 weight scales. The static build (`paraketto.fp8.static`) embeds `weights_fp8.bin` via `objcopy` — no `weights.bin` needed at runtime, only the NVIDIA driver and cuBLAS/cublasLt shared libraries.
+The cache format is a simple flat binary: 16-byte header (`PRKTFP8\0` + version + pad) followed by packed FP8 weight data and float32 weight scales. The static build (`paraketto.fp8.static`) embeds `paraketto-fp8.bin` via `objcopy` — no `paraketto-fp16.bin` needed at runtime, only the NVIDIA driver and cuBLAS/cublasLt shared libraries.
 
 ---
 
@@ -1501,9 +1501,9 @@ Total: **194 of 218** `quantize_fp8_static` calls eliminated. The remaining 24 a
 
 ### Challenges
 
-**Corrupted weights during benchmarking.** The Makefile recipe for generating `weights_fp8.bin` passes `--weights weights.bin` to `paraketto.fp8`, which the FP8 binary interprets as the FP8 target path — so `fp8_save()` overwrites `weights.bin` with FP8 data instead of creating `weights_fp8.bin`. This destroyed the FP16 weights during the first benchmark attempt. The fix: regenerate `weights_fp8.bin` with default paths (no `--weights` override), and re-download `weights.bin`.
+**Corrupted weights during benchmarking.** The Makefile recipe for generating `paraketto-fp8.bin` passes `--weights paraketto-fp16.bin` to `paraketto.fp8`, which the FP8 binary interprets as the FP8 target path — so `fp8_save()` overwrites `paraketto-fp16.bin` with FP8 data instead of creating `paraketto-fp8.bin`. This destroyed the FP16 weights during the first benchmark attempt. The fix: regenerate `paraketto-fp8.bin` with default paths (no `--weights` override), and re-download `paraketto-fp16.bin`.
 
-**Benchmark variance from corrupted weights.** Before the corruption was identified, benchmark numbers were erratic (1119x–1330x across runs). This looked like thermal throttling but was actually caused by running with a `weights_fp8.bin` that had been generated through the buggy path. After regenerating cleanly, variance dropped to <2% across runs.
+**Benchmark variance from corrupted weights.** Before the corruption was identified, benchmark numbers were erratic (1119x–1330x across runs). This looked like thermal throttling but was actually caused by running with a `paraketto-fp8.bin` that had been generated through the buggy path. After regenerating cleanly, variance dropped to <2% across runs.
 
 ### Results
 
@@ -1550,7 +1550,7 @@ A surprising and reproducible result: FP8 gets **better** WER than FP16 on the d
 
 The pattern is consistent with quantization noise acting as **regularization**: on clean, in-distribution speech where the model is well-calibrated, the noise slightly hurts. On accented/noisy speech where the model may overfit to training-distribution patterns, the noise breaks spurious correlations and improves generalization. The effect is localized to the encoder (the decoder stays FP16 since cublasLt FP8 doesn't support N=1 GEMMs).
 
-The **recommended binary for production use** is `paraketto.fp8` with pre-generated `weights_fp8.bin`.
+The **recommended binary for production use** is `paraketto.fp8` with pre-generated `paraketto-fp8.bin`.
 
 ## Distribution: Auto-download from HuggingFace
 

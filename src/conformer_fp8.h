@@ -20,12 +20,12 @@
 // Weight file format
 // ---------------------------------------------------------------------------
 //
-// weights.bin (FP16 source, needed only for first-run FP8 quantization):
+// paraketto-fp16.bin (FP16 source, needed only for first-run FP8 quantization):
 //   uint32 magic   = 0x544B5250 ("PRKT")
 //   uint32 version = 2
 //   [raw FP16 tensor data, 256-byte aligned, fixed layout from source]
 //
-// weights_fp8.bin (self-contained FP8 weights, all needed data):
+// paraketto-fp8.bin (self-contained FP8 weights, all needed data):
 //   char[8] magic  = "PRKTFP8\0"
 //   uint32  version = 1
 //   uint32  pad     = 0
@@ -203,9 +203,9 @@ struct CudaModel {
     void*            lt_workspace      = nullptr;
     size_t           lt_workspace_size = 0;
 
-    /// fp8_path: path to weights_fp8.bin (load if exists, save after quantization).
-    /// Pass "embedded" when weights_fp8.bin is compiled in (EMBEDDED_WEIGHTS build).
-    /// fp8_prefetch: pre-populated mmap of weights_fp8.bin (from background prefetch thread).
+    /// fp8_path: path to paraketto-fp8.bin (load if exists, save after quantization).
+    /// Pass "embedded" when paraketto-fp8.bin is compiled in (EMBEDDED_WEIGHTS build).
+    /// fp8_prefetch: pre-populated mmap of paraketto-fp8.bin (from background prefetch thread).
     void init(const Weights& weights, cudaStream_t s, int max_mel_frames,
               const char* fp8_path = nullptr,
               const void* fp8_prefetch = nullptr, size_t fp8_prefetch_size = 0);

@@ -54,9 +54,9 @@ Time from process start to first inference, measured with `tests/bench_startup.p
 
 ```
                 startup (cold / warm)
-CUTLASS:       600ms / 240ms      weights.bin (1.2 GB)
-cuBLAS:        620ms / 240ms      weights.bin (1.2 GB)
-FP8:           325ms / 180ms      weights_fp8.bin (604 MB)
+CUTLASS:       600ms / 240ms      paraketto-fp16.bin (1.2 GB)
+cuBLAS:        620ms / 240ms      paraketto-fp16.bin (1.2 GB)
+FP8:           325ms / 180ms      paraketto-fp8.bin (604 MB)
 ```
 
 Cold = weight files not in OS page cache. Warm = cached.
@@ -78,9 +78,9 @@ Three CUDA backends, same driver and weight loader:
 
 | Binary | GEMM backend | Weights | Notes |
 |--------|-------------|---------|-------|
-| `paraketto.cuda` | CUTLASS FP16 (custom-tuned) | `weights.bin` (1.2 GB) | default, no cuBLAS dep |
-| `paraketto.cublas` | cuBLAS/cublasLt FP16 | `weights.bin` (1.2 GB) | |
-| `paraketto.fp8` | cublasLt FP8 E4M3 | `weights_fp8.bin` (604 MB) | Blackwell only |
+| `paraketto.cuda` | CUTLASS FP16 (custom-tuned) | `paraketto-fp16.bin` (1.2 GB) | default, no cuBLAS dep |
+| `paraketto.cublas` | cuBLAS/cublasLt FP16 | `paraketto-fp16.bin` (1.2 GB) | |
+| `paraketto.fp8` | cublasLt FP8 E4M3 | `paraketto-fp8.bin` (604 MB) | Blackwell only |
 
 ## Quick start
 
@@ -103,7 +103,7 @@ Weights are downloaded from [HuggingFace](https://huggingface.co/localoptima/par
 
 ```bash
 make paraketto.fp8               # build FP8 binary
-./paraketto.fp8 audio.wav        # auto-downloads weights_fp8.bin (~604 MB)
+./paraketto.fp8 audio.wav        # auto-downloads paraketto-fp8.bin (~604 MB)
 ```
 
 ## Usage
@@ -188,8 +188,8 @@ make bench-all     # all backends
 ## Static binary (no runtime files)
 
 ```bash
-make paraketto.static      # embeds weights.bin, CUTLASS FP16
-make paraketto.fp8.static  # embeds weights_fp8.bin, FP8
+make paraketto.static      # embeds paraketto-fp16.bin, CUTLASS FP16
+make paraketto.fp8.static  # embeds paraketto-fp8.bin, FP8
 ```
 
 Requires only the NVIDIA driver + shared CUDA/cuBLAS libraries. No weights files at runtime.
@@ -208,7 +208,7 @@ src/cublas_gemm.cu        # cuBLAS FP16 backend
 src/kernels.cu            # Custom kernels: FFT, LayerNorm, SiLU, GLU, conv, LSTM, ...
 src/kernels_fp8.cu        # FP8 kernels: absmax quantize, static quantize, fused FP8 output
 src/mel.h                 # Custom 512-point FFT + mel filterbank
-scripts/export_weights.py # NeMo → weights.bin converter
+scripts/export_weights.py # NeMo → paraketto-fp16.bin converter
 ```
 
 ## References

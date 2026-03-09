@@ -1,12 +1,12 @@
 // weights.cpp — Weight loading shared by FP16 and FP8 backends
 //
-// weights.bin format:
+// paraketto-fp16.bin format:
 //   uint32 magic   = WEIGHTS_MAGIC (0x544B5250 "PRKT")
 //   uint32 version = WEIGHTS_VERSION (2)
 //   [raw FP16 tensors, 256-byte aligned, in the fixed order below]
 //
 // The layout defined here IS the file format. No separate index or header.
-// Changing this layout requires regenerating weights.bin (run repack_weights.py).
+// Changing this layout requires regenerating paraketto-fp16.bin (run repack_weights.py).
 
 #include "conformer.h"
 #include "common.h"
@@ -106,7 +106,7 @@ static size_t assign_weight_pointers(Weights& w) {
 }
 
 // ---------------------------------------------------------------------------
-// Weights::prefetch — mmap weights.bin (CPU only, no CUDA)
+// Weights::prefetch — mmap paraketto-fp16.bin (CPU only, no CUDA)
 // ---------------------------------------------------------------------------
 
 Weights Weights::prefetch(const std::string& path, bool populate) {

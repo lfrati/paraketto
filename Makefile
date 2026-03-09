@@ -6,16 +6,16 @@ NVFLAGS  = -std=c++17 -O3 -I$(CUDA_HOME)/include -Isrc --expt-relaxed-constexpr
 
 HF_BASE     = https://huggingface.co/localoptima/paraketto/resolve/main
 WEIGHTS_DIR = $(or $(XDG_CACHE_HOME),$(HOME)/.cache)/paraketto
-WEIGHTS     = $(WEIGHTS_DIR)/weights.bin
-WEIGHTS_FP8 = $(WEIGHTS_DIR)/weights_fp8.bin
+WEIGHTS     = $(WEIGHTS_DIR)/paraketto-fp16.bin
+WEIGHTS_FP8 = $(WEIGHTS_DIR)/paraketto-fp8.bin
 
 .PHONY: bench-all bench-cuda bench-cublas bench-fp8 weights weights-fp8 download-data download-weights check-weights clean
 
-# Verify weights.bin is the expected format (PRKT v2)
+# Verify paraketto-fp16.bin is the expected format (PRKT v2)
 check-weights: $(WEIGHTS)
 	@v=$$(od -An -td4 -N4 -j4 $(WEIGHTS) | tr -d ' '); \
 	if [ "$$v" != "2" ]; then \
-		echo "ERROR: weights.bin is version $$v, expected 2. Run: uv run python scripts/repack_weights.py"; \
+		echo "ERROR: paraketto-fp16.bin is version $$v, expected 2. Run: uv run python scripts/repack_weights.py"; \
 		exit 1; \
 	fi
 
@@ -32,14 +32,14 @@ download-data: data/librispeech/manifest.json
 # Download weights from HuggingFace
 $(WEIGHTS):
 	@mkdir -p $(WEIGHTS_DIR)
-	@echo "Downloading weights.bin..."
-	@wget -q --show-progress -O $@ $(HF_BASE)/weights.bin
+	@echo "Downloading paraketto-fp16.bin..."
+	@wget -q --show-progress -O $@ $(HF_BASE)/paraketto-fp16.bin
 	@echo "Downloaded $@ ($$(du -h $@ | cut -f1))"
 
 $(WEIGHTS_FP8):
 	@mkdir -p $(WEIGHTS_DIR)
-	@echo "Downloading weights_fp8.bin..."
-	@wget -q --show-progress -O $@ $(HF_BASE)/weights_fp8.bin
+	@echo "Downloading paraketto-fp8.bin..."
+	@wget -q --show-progress -O $@ $(HF_BASE)/paraketto-fp8.bin
 	@echo "Downloaded $@ ($$(du -h $@ | cut -f1))"
 
 download-weights: $(WEIGHTS)
@@ -108,7 +108,7 @@ src/conformer_fp8.o: src/conformer_fp8.cpp src/conformer_fp8.h src/conformer.h s
 paraketto.fp8: src/paraketto_cuda.cpp src/conformer_fp8.h src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o $(SHARED_HEADERS)
 	$(CXX) $(CUDA_CXXFLAGS) -include src/conformer_fp8.h src/paraketto_cuda.cpp src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o $(CUDA_LDFLAGS) -lcublas -lcublasLt -o $@
 
-# (weights_fp8.bin generation removed — paraketto.fp8 auto-downloads from HF)
+# (paraketto-fp8.bin generation removed — paraketto.fp8 auto-downloads from HF)
 
 # Convert existing weight files to current format (run once after updating)
 repack: $(WEIGHTS)
@@ -132,7 +132,7 @@ paraketto.static: $(CONFORMER_DEPS) src/kernels.o src/cutlass_gemm.o src/cutlass
 		-L$(CUDA_HOME)/lib64 $(CUDA_HOME)/lib64/libcudart_static.a -ldl -lpthread -lrt \
 		-o $@
 
-# FP8 static: embeds only weights_fp8.bin — no weights.bin needed at runtime
+# FP8 static: embeds only paraketto-fp8.bin — no paraketto-fp16.bin needed at runtime
 paraketto.fp8.static: src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o weights_fp8_embedded.o $(SHARED_HEADERS) src/conformer_fp8.h
 	$(CXX) $(CUDA_CXXFLAGS) -DEMBEDDED_WEIGHTS -include src/conformer_fp8.h \
 		src/paraketto_cuda.cpp src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o \

@@ -28,8 +28,8 @@
 
 #ifdef EMBEDDED_WEIGHTS
 extern "C" {
-    extern const uint8_t _binary_weights_fp8_bin_start[];
-    extern const uint8_t _binary_weights_fp8_bin_end[];
+    extern const uint8_t _binary_paraketto_fp8_bin_start[];
+    extern const uint8_t _binary_paraketto_fp8_bin_end[];
 }
 #endif
 
@@ -263,7 +263,7 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
 
 
         // ---------------------------------------------------------------------------
-        // FP8 weight cache — weights_fp8.bin format:
+        // FP8 weight cache — paraketto-fp8.bin format:
         //   char[8]  magic   = "PRKTFP8\0"
         //   uint32   version = FP8_WEIGHTS_VERSION (1)
         //   uint32   pad     = 0
@@ -348,7 +348,7 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
             fclose(f);
 
             size_t total_mb = (pool_weights_size + fp16_buf.size() * sizeof(half)) / (1024*1024);
-            fprintf(stderr, "  saved weights_fp8.bin to %s (%zu MB)\n", path, total_mb);
+            fprintf(stderr, "  saved paraketto-fp8.bin to %s (%zu MB)\n", path, total_mb);
         };
 
         auto fp8_load = [&](const char* path) -> bool {
@@ -357,8 +357,8 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
             void* mmap_ptr = nullptr;  // only set if we did our own mmap (need to munmap)
 
 #ifdef EMBEDDED_WEIGHTS
-            base     = _binary_weights_fp8_bin_start;
-            map_size = (size_t)(_binary_weights_fp8_bin_end - _binary_weights_fp8_bin_start);
+            base     = _binary_paraketto_fp8_bin_start;
+            map_size = (size_t)(_binary_paraketto_fp8_bin_end - _binary_paraketto_fp8_bin_start);
 #else
             if (fp8_prefetch) {
                 // Use pre-populated mapping from background prefetch thread
@@ -439,7 +439,7 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
             if (mmap_ptr) munmap(mmap_ptr, map_size);
 
             size_t total_mb = (pool_weights_size + off) / (1024 * 1024);
-            fprintf(stderr, "  loaded weights_fp8.bin from %s (%zu MB)\n", path, total_mb);
+            fprintf(stderr, "  loaded paraketto-fp8.bin from %s (%zu MB)\n", path, total_mb);
             return true;
         };
 

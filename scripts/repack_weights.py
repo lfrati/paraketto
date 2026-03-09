@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Convert existing weight files to the current format.
 
-weights.bin:    old PRKT v1 (with text header) → new PRKT v2 (headerless, fixed order)
-weights_fp8.bin: old PRKTFP8 (24-byte header)  → new PRKTFP8 v1 (16-byte header)
+paraketto-fp16.bin: old PRKT v1 (with text header) → new PRKT v2 (headerless, fixed order)
+paraketto-fp8.bin:  old PRKTFP8 (24-byte header)  → new PRKTFP8 v1 (16-byte header)
 
 Run once after pulling this update. Does not require ONNX re-export.
 
 Usage:
   uv run python scripts/repack_weights.py              # repack both files in-place
-  uv run python scripts/repack_weights.py weights.bin  # repack only weights.bin
+  uv run python scripts/repack_weights.py paraketto-fp16.bin  # repack only paraketto-fp16.bin
 """
 
 import struct
@@ -190,7 +190,7 @@ def repack_fp8(src: Path, dst: Path) -> None:
 
 def main() -> None:
     repo = Path(__file__).resolve().parent.parent
-    targets = sys.argv[1:] if len(sys.argv) > 1 else ["weights.bin", "weights_fp8.bin"]
+    targets = sys.argv[1:] if len(sys.argv) > 1 else ["paraketto-fp16.bin", "paraketto-fp8.bin"]
 
     for name in targets:
         path = repo / name

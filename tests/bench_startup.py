@@ -23,7 +23,7 @@ DATA_DIR = ROOT / "data"
 ALL_BINARIES = ["paraketto.cuda", "paraketto.cublas", "paraketto.fp8"]
 
 # Weight files to evict from page cache for cold runs
-WEIGHT_FILES = ["weights.bin", "weights_fp8.bin"]
+WEIGHT_FILES = ["paraketto-fp16.bin", "paraketto-fp8.bin"]
 
 STARTUP_RE = re.compile(
     r"startup:\s+(\d+)ms\s+\(cuda=(\d+)\s+prefetch=(\d+)\s+load=(\d+)\)"

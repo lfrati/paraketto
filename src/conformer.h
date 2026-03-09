@@ -1,7 +1,7 @@
 // conformer.h — Weight loading + CUDA inference for Parakeet conformer
 //
 // Defines:
-//   Weights  — pointers into GPU weight allocation (loaded from weights.bin)
+//   Weights  — pointers into GPU weight allocation (loaded from paraketto-fp16.bin)
 //   CudaModel — pre-allocated buffers + GEMM backend for forward passes
 
 #ifndef CONFORMER_H_
@@ -18,7 +18,7 @@
 // Weight file format
 // ---------------------------------------------------------------------------
 //
-// weights.bin:
+// paraketto-fp16.bin:
 //   uint32 magic   = 0x544B5250 ("PRKT" little-endian)
 //   uint32 version = 2
 //   [raw FP16 tensor data, 256-byte aligned, fixed order matching source layout]
@@ -146,7 +146,7 @@ struct Weights {
     // Methods
     // ---------------------------------------------------------------------------
 
-    /// Prefetch: mmap weights.bin (CPU only, no CUDA).
+    /// Prefetch: mmap paraketto-fp16.bin (CPU only, no CUDA).
     /// populate=false skips MAP_POPULATE (FP8 path: only GPU layout needed).
     static Weights prefetch(const std::string& path, bool populate = true);
 
@@ -157,7 +157,7 @@ struct Weights {
     void upload(cudaStream_t stream = nullptr);
 
     /// FP8 path: cudaMalloc + assign pointers only (no data upload).
-    /// fp8_load() will populate GPU memory from weights_fp8.bin.
+    /// fp8_load() will populate GPU memory from paraketto-fp8.bin.
     void allocate_only();
 
     /// Free the GPU allocation.

@@ -57,11 +57,11 @@ static void ensure_file(const std::string& path, const char* url) {
 #ifdef EMBEDDED_WEIGHTS
 extern "C" {
 #  ifdef PARAKETTO_FP8
-    extern const uint8_t _binary_weights_fp8_bin_start[];
-    extern const uint8_t _binary_weights_fp8_bin_end[];
+    extern const uint8_t _binary_paraketto_fp8_bin_start[];
+    extern const uint8_t _binary_paraketto_fp8_bin_end[];
 #  else
-    extern const uint8_t _binary_weights_bin_start[];
-    extern const uint8_t _binary_weights_bin_end[];
+    extern const uint8_t _binary_paraketto_fp16_bin_start[];
+    extern const uint8_t _binary_paraketto_fp16_bin_end[];
 #  endif
 }
 #endif
@@ -76,9 +76,9 @@ struct Pipeline {
     MelSpec mel;
     cudaStream_t stream = nullptr;
 
-    // fp8_ready: non-empty = weights_fp8.bin exists and is valid (use allocate_only).
-    // fp8_target: path to load/save weights_fp8.bin (may differ on first run).
-    // fp8_prefetch: pre-populated mmap of weights_fp8.bin from background thread.
+    // fp8_ready: non-empty = paraketto-fp8.bin exists and is valid (use allocate_only).
+    // fp8_target: path to load/save paraketto-fp8.bin (may differ on first run).
+    // fp8_prefetch: pre-populated mmap of paraketto-fp8.bin from background thread.
     void init(Weights&& prefetched,
               const std::string& fp8_ready  = "",
               const std::string& fp8_target = "",
@@ -204,10 +204,10 @@ int main(int argc, char** argv) {
     std::string dir = cache_dir();
     bool custom_weights = false;
 #ifdef PARAKETTO_FP8
-    std::string weights_path = dir + "/weights_fp8.bin";
-    std::string fp16_path    = dir + "/weights.bin";
+    std::string weights_path = dir + "/paraketto-fp8.bin";
+    std::string fp16_path    = dir + "/paraketto-fp16.bin";
 #else
-    std::string weights_path = dir + "/weights.bin";
+    std::string weights_path = dir + "/paraketto-fp16.bin";
 #endif
     std::vector<std::string> wav_files;
     bool server_mode = false;
@@ -246,10 +246,10 @@ int main(int argc, char** argv) {
 #ifndef EMBEDDED_WEIGHTS
     if (!custom_weights) {
 #  ifdef PARAKETTO_FP8
-        ensure_file(weights_path, "https://huggingface.co/localoptima/paraketto/resolve/main/weights_fp8.bin");
+        ensure_file(weights_path, "https://huggingface.co/localoptima/paraketto/resolve/main/paraketto-fp8.bin");
         // FP16 weights needed only for first-run quantization (if fp8 file is missing/invalid)
 #  else
-        ensure_file(weights_path, "https://huggingface.co/localoptima/paraketto/resolve/main/weights.bin");
+        ensure_file(weights_path, "https://huggingface.co/localoptima/paraketto/resolve/main/paraketto-fp16.bin");
 #  endif
     }
 #endif
@@ -258,9 +258,9 @@ int main(int argc, char** argv) {
     std::thread prefetch_thread;
 
     // For FP8: check whether the fp8 weights file is ready before starting prefetch.
-    // Check if weights_fp8.bin is present and valid.
-    // If yes: allocate_only() + fp8_load (skip weights.bin upload).
-    // If no:  upload weights.bin FP16, quantize, save weights_fp8.bin.
+    // Check if paraketto-fp8.bin is present and valid.
+    // If yes: allocate_only() + fp8_load (skip paraketto-fp16.bin upload).
+    // If no:  upload paraketto-fp16.bin FP16, quantize, save paraketto-fp8.bin.
     std::string fp8_path_for_init;
     void* fp8_prefetch_ptr = nullptr;
     size_t fp8_prefetch_size = 0;
@@ -279,18 +279,18 @@ int main(int argc, char** argv) {
         }
         // FP8 file missing or invalid — need FP16 weights for quantization
         if (fp8_path_for_init.empty() && !custom_weights) {
-            ensure_file(fp16_path, "https://huggingface.co/localoptima/paraketto/resolve/main/weights.bin");
+            ensure_file(fp16_path, "https://huggingface.co/localoptima/paraketto/resolve/main/paraketto-fp16.bin");
         }
     }
 #endif
 
 #ifdef EMBEDDED_WEIGHTS
 #  ifdef PARAKETTO_FP8
-    fp8_path_for_init = "embedded";  // FP8 static: weights_fp8.bin is embedded
+    fp8_path_for_init = "embedded";  // FP8 static: paraketto-fp8.bin is embedded
     prefetched = Weights{};          // allocate_only() computes layout from constants
 #  else
-    prefetched = Weights::from_embedded(_binary_weights_bin_start,
-        _binary_weights_bin_end - _binary_weights_bin_start);
+    prefetched = Weights::from_embedded(_binary_paraketto_fp16_bin_start,
+        _binary_paraketto_fp16_bin_end - _binary_paraketto_fp16_bin_start);
 #  endif
 #else
     // Prefetch in background while CUDA context inits.
