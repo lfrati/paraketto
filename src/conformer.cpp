@@ -7,7 +7,6 @@
 #include "common.h"
 #include "kernels.h"
 #include "gemm.h"
-
 #include <cassert>
 #include <cmath>
 #include <cstdio>

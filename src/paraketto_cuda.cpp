@@ -158,12 +158,15 @@ int main(int argc, char** argv) {
         fprintf(stderr,
             "Usage: %s [OPTIONS] <wav_file>...\n"
             "\n"
-            "Speech-to-text using Paraketto (CUDA/cuBLAS backend).\n"
+            "Speech-to-text using Paraketto (CUDA backend).\n"
             "Accepts one or more 16kHz or 24kHz mono WAV files (int16 or float32).\n"
             "\n"
             "Options:\n"
             "  --weights FILE             Model weights [default: weights.bin]\n"
             "  --server [[host]:port]     Start HTTP server [default: 0.0.0.0:8080]\n"
+#ifdef PARAKETTO_FP8
+            "  --calibrate                Run offline calibration (FP8 build only)\n"
+#endif
             "  -h, --help                 Show this help\n",
             argv[0]);
     };
@@ -178,6 +181,7 @@ int main(int argc, char** argv) {
 #endif
     std::vector<std::string> wav_files;
     bool server_mode = false;
+    bool calibrate_mode = false;
     std::string server_host = "0.0.0.0";
     int server_port = 8080;
 
@@ -196,12 +200,14 @@ int main(int argc, char** argv) {
                     server_port = std::stoi(addr.substr(colon + 1));
                 }
             }
+        } else if (arg == "--calibrate") {
+            calibrate_mode = true;
         } else {
             wav_files.push_back(arg);
         }
     }
 
-    if (!server_mode && wav_files.empty()) {
+    if (!server_mode && !calibrate_mode && wav_files.empty()) {
         fprintf(stderr, "No WAV files specified.\n");
         return 1;
     }
@@ -298,6 +304,57 @@ int main(int argc, char** argv) {
         munmap(fp8_prefetch_ptr, fp8_prefetch_size);
         fp8_prefetch_ptr = nullptr;
     }
+
+#if defined(PARAKETTO_FP8)
+    if (calibrate_mode) {
+        if (wav_files.empty()) {
+            fprintf(stderr, "No WAV files specified for calibration.\n");
+            return 1;
+        }
+        auto& m = pipeline.cuda_model;
+        m.calibrating = true;
+
+        fprintf(stderr, "Calibrating with %zu files...\n", wav_files.size());
+        for (size_t fi = 0; fi < wav_files.size(); fi++) {
+            WavData wav = read_wav(wav_files[fi]);
+            int n_frames, n_valid;
+            pipeline.mel.compute(wav.samples.data(), wav.samples.size(),
+                                  m.mel_fp32, n_frames, n_valid, pipeline.stream);
+            CUDA_CHECK(cudaStreamSynchronize(pipeline.stream));
+
+            // Run encoder (calibration pass — absmax scales computed)
+            m.encode_gpu(n_valid);
+            CUDA_CHECK(cudaStreamSynchronize(pipeline.stream));
+
+            // Copy per-site scales to host and update max absmax
+            float site_scales[CudaModel::N_FP8_ACT_SITES];
+            CUDA_CHECK(cudaMemcpy(site_scales, m.fp8_act_site_scales,
+                                   sizeof(site_scales), cudaMemcpyDeviceToHost));
+            for (int i = 0; i < CudaModel::N_FP8_ACT_SITES; i++) {
+                // site_scales[i] = absmax / 448.0 (from quantize_absmax_fp16_to_fp8)
+                float absmax = site_scales[i] * 448.0f;
+                if (absmax > m.host_act_absmax[i])
+                    m.host_act_absmax[i] = absmax;
+            }
+
+            // Reset calibrated flag for next utterance
+            m.fp8_calibrated = false;
+            m.cutlass_scales_ready = false;
+
+            if ((fi + 1) % 10 == 0 || fi + 1 == wav_files.size())
+                fprintf(stderr, "  calibrated %zu/%zu files\n", fi + 1, wav_files.size());
+        }
+
+        // Finalize: compute scales from max absmax, upload to GPU
+        m.finalize_calibration();
+        m.save_calibrated(weights_path.c_str());
+
+        fprintf(stderr, "Calibration complete. weights_fp8.bin saved to %s\n", weights_path.c_str());
+        return 0;
+    }
+#else
+    (void)calibrate_mode;
+#endif
 
     if (server_mode) {
         // Warmup with 1s of silence

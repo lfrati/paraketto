@@ -39,7 +39,7 @@ bench-all: paraketto.cuda paraketto.cublas paraketto.fp8 data/librispeech/manife
 	@uv run python tests/bench_native.py paraketto.cuda
 	$(call BENCH_SEP,C++ cuBLAS · paraketto_cuda.cpp + cuBLAS FP16)
 	@uv run python tests/bench_native.py paraketto.cublas
-	$(call BENCH_SEP,C++ FP8  · paraketto_cuda.cpp + cublasLt FP8)
+	$(call BENCH_SEP,C++ FP8  · paraketto_cuda.cpp + CUTLASS FP8)
 	@uv run python tests/bench_native.py paraketto.fp8
 
 bench-cuda: paraketto.cuda data/librispeech/manifest.json check-weights
@@ -86,22 +86,34 @@ src/cublas_gemm.o: src/cublas_gemm.cu src/gemm.h src/kernels.h
 paraketto.cublas: $(CONFORMER_DEPS) src/weights.o src/kernels.o src/cublas_gemm.o
 	$(CXX) $(CUDA_CXXFLAGS) src/paraketto_cuda.cpp src/conformer.cpp src/weights.o src/kernels.o src/cublas_gemm.o $(CUDA_LDFLAGS) -lcublas -lcublasLt -o $@
 
-# FP8 cublasLt backend
+# FP8 backend (CUTLASS SM120 for all GEMMs — no cuBLAS dependency)
 src/kernels_fp8.o: src/kernels_fp8.cu src/kernels_fp8.h
 	$(NVCC) $(NVFLAGS) -arch=sm_120a -c $< -o $@
 
-src/conformer_fp8.o: src/conformer_fp8.cpp src/conformer_fp8.h src/conformer.h src/kernels.h src/kernels_fp8.h
+src/cutlass_fp8_gemm.o: src/cutlass_fp8_gemm.cu src/cutlass_fp8_gemm.h
+	$(NVCC) $(NVFLAGS) -arch=sm_120a $(CUTLASS_INC) -c $< -o $@
+
+src/conformer_fp8.o: src/conformer_fp8.cpp src/conformer_fp8.h src/conformer.h src/kernels.h src/kernels_fp8.h src/cutlass_fp8_gemm.h src/cutlass_gemm.h
 	$(CXX) $(CUDA_CXXFLAGS) -I$(CUDA_HOME)/include -c $< -o $@
 
-paraketto.fp8: src/paraketto_cuda.cpp src/conformer_fp8.h src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o $(SHARED_HEADERS)
-	$(CXX) $(CUDA_CXXFLAGS) -include src/conformer_fp8.h src/paraketto_cuda.cpp src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o $(CUDA_LDFLAGS) -lcublas -lcublasLt -o $@
+paraketto.fp8: src/paraketto_cuda.cpp src/conformer_fp8.h src/conformer_fp8.o \
+               src/weights.o src/kernels.o src/kernels_fp8.o \
+               src/cutlass_gemm.o src/cutlass_fp8_gemm.o $(SHARED_HEADERS)
+	$(CXX) $(CUDA_CXXFLAGS) -include src/conformer_fp8.h \
+		src/paraketto_cuda.cpp src/conformer_fp8.o src/weights.o \
+		src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cutlass_fp8_gemm.o \
+		$(CUDA_LDFLAGS) -o $@
 
-# Generate FP8 weight cache (quantized from weights.bin, auto-saved by paraketto.fp8 on first run)
-weights_fp8.bin: paraketto.fp8 weights.bin
-	@echo "Generating FP8 weight cache (quantizing weights.bin → weights_fp8.bin)..."
-	@rm -f weights_fp8.bin
-	@./paraketto.fp8 --weights weights.bin /dev/null 2>&1 | grep -E "saved|loaded|FP8" || true
-	@test -f weights_fp8.bin || (echo "ERROR: weights_fp8.bin not created" && exit 1)
+# Generate FP8 weight cache with offline calibration
+# Requires weights.bin for initial quantization + calibration data for activation scales
+weights_fp8.bin: paraketto.fp8 data/librispeech/manifest.json
+	@if [ -f $@ ]; then echo "weights_fp8.bin already exists, skipping generation"; \
+	else \
+		test -f weights.bin || $(MAKE) weights.bin; \
+		echo "Generating FP8 weights with calibration..."; \
+		./paraketto.fp8 --calibrate data/librispeech/*.wav; \
+		test -f $@ || (echo "ERROR: weights_fp8.bin not created" && exit 1); \
+	fi
 
 weights-fp8: weights_fp8.bin
 
@@ -128,13 +140,14 @@ paraketto.static: $(CONFORMER_DEPS) src/kernels.o src/cutlass_gemm.o src/cutlass
 		-o $@
 
 # FP8 static: embeds only weights_fp8.bin — no weights.bin needed at runtime
-paraketto.fp8.static: src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o weights_fp8_embedded.o $(SHARED_HEADERS) src/conformer_fp8.h
+paraketto.fp8.static: src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o \
+                       src/cutlass_gemm.o src/cutlass_fp8_gemm.o weights_fp8_embedded.o \
+                       $(SHARED_HEADERS) src/conformer_fp8.h
 	$(CXX) $(CUDA_CXXFLAGS) -DEMBEDDED_WEIGHTS -include src/conformer_fp8.h \
 		src/paraketto_cuda.cpp src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o \
-		weights_fp8_embedded.o \
+		src/cutlass_gemm.o src/cutlass_fp8_gemm.o weights_fp8_embedded.o \
 		-static-libstdc++ -static-libgcc \
 		-L$(CUDA_HOME)/lib64 $(CUDA_HOME)/lib64/libcudart_static.a -ldl -lpthread -lrt \
-		-lcublas -lcublasLt \
 		-o $@
 
 bench_gemm: tests/bench_gemm.cu
@@ -149,5 +162,8 @@ bench_tiles: tests/bench_tiles.cu
 bench_ff2: tests/bench_ff2.cu
 	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) tests/bench_ff2.cu -lcublas -lcublasLt -o $@
 
+bench_fp8: tests/bench_fp8.cu src/cutlass_fp8_gemm.o src/kernels_fp8.o
+	$(NVCC) $(NVFLAGS) -arch=sm_120a $(CUTLASS_INC) tests/bench_fp8.cu src/cutlass_fp8_gemm.o src/kernels_fp8.o -lcublas -lcublasLt -o $@
+
 clean:
-	rm -f paraketto.cuda paraketto.cublas paraketto.fp8 paraketto.static paraketto.fp8.static src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cublas_gemm.o src/weights.o src/conformer_fp8.o weights_embedded.o weights_fp8_embedded.o
+	rm -f paraketto.cuda paraketto.cublas paraketto.fp8 paraketto.static paraketto.fp8.static bench_fp8 src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cutlass_fp8_gemm.o src/cublas_gemm.o src/weights.o src/conformer_fp8.o weights_embedded.o weights_fp8_embedded.o

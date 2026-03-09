@@ -1,11 +1,13 @@
-// conformer_fp8.cpp — FP8 CudaModel inference (cublasLt FP8 backend)
+// conformer_fp8.cpp — FP8 CudaModel inference (CUTLASS FP8 backend)
 //
-// FP8 E4M3 weight quantization at init time, FP8 GEMMs via cublasLt.
+// FP8 E4M3 weight quantization at init time, FP8 GEMMs via CUTLASS SM120.
 
 #include "conformer_fp8.h"
 #include "common.h"
 #include "kernels.h"
 #include "kernels_fp8.h"
+#include "cutlass_fp8_gemm.h"
+#include "cutlass_gemm.h"
 
 #include <cassert>
 #include <cmath>
@@ -13,10 +15,6 @@
 #include <cstdlib>
 #include <cstring>
 
-#include <cublas_v2.h>
-#include <cublasLt.h>
-
-#include <unordered_map>
 #include <vector>
 
 #include <fcntl.h>
@@ -37,17 +35,6 @@ extern "C" {
 // CudaModel — encoder + decoder forward pass
 // =========================================================================
 
-// cuBLAS error checking
-#define CUBLAS_CHECK(call)                                                     \
-    do {                                                                       \
-        cublasStatus_t stat = (call);                                         \
-        if (stat != CUBLAS_STATUS_SUCCESS) {                                  \
-            fprintf(stderr, "cuBLAS error at %s:%d: %d\n",                    \
-                    __FILE__, __LINE__, (int)stat);                            \
-            std::exit(1);                                                     \
-        }                                                                     \
-    } while (0)
-
 // ---------------------------------------------------------------------------
 // CudaModel::init
 // ---------------------------------------------------------------------------
@@ -59,15 +46,8 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
     stream = s;
     T_max = max_mel_frames / 8 + 10;  // encoder frames after 8x downsampling
 
-    CUBLAS_CHECK(cublasCreate(&cublas));
-    CUBLAS_CHECK(cublasSetStream(cublas, stream));
-    CUBLAS_CHECK(cublasSetMathMode(cublas, CUBLAS_TENSOR_OP_MATH));
-    CUBLAS_CHECK(cublasLtCreate(&cublaslt));
-
-    // Shared workspace for cublasLt algorithm search and matmul
-    lt_workspace_size = 32 * 1024 * 1024;  // 32MB workspace
-    CUDA_CHECK(cudaMalloc(&lt_workspace, lt_workspace_size));
-    CUBLAS_CHECK(cublasSetWorkspace(cublas, lt_workspace, lt_workspace_size));
+    // Initialize CUTLASS FP16 GEMM module (workspace allocation)
+    cutlass_gemm_init(stream);
 
     // --- Single pooled GPU allocation for all inference buffers ---
     // Replaces ~35 individual cudaMalloc calls with one.
@@ -326,13 +306,21 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
             FILE* f = fopen(path, "wb");
             if (!f) { fprintf(stderr, "  warning: cannot write %s\n", path); return; }
 
-            // 16-byte header: magic(8) + version(4) + pad(4)
+            // 16-byte header: magic(8) + version(4) + n_act_sites(4)
             const char magic[8] = "PRKTFP8";
-            uint32_t version = FP8_WEIGHTS_VERSION, pad = 0;
+            uint32_t version = FP8_WEIGHTS_VERSION;
+            uint32_t n_act_sites = fp8_calibrated ? (uint32_t)N_FP8_ACT_SITES : 0;
             fwrite(magic,           8, 1, f);
             fwrite(&version,        4, 1, f);
-            fwrite(&pad,            4, 1, f);
+            fwrite(&n_act_sites,    4, 1, f);
             fwrite(pool_buf.data(), 1, pool_weights_size, f);
+            // Activation scales (only if calibrated)
+            if (n_act_sites > 0) {
+                std::vector<float> act_scales(N_FP8_ACT_SITES);
+                CUDA_CHECK(cudaMemcpy(act_scales.data(), fp8_act_site_scales,
+                                       N_FP8_ACT_SITES * sizeof(float), cudaMemcpyDeviceToHost));
+                fwrite(act_scales.data(), sizeof(float), N_FP8_ACT_SITES, f);
+            }
             fwrite(fp16_buf.data(), sizeof(half), fp16_buf.size(), f);
             fclose(f);
 
@@ -366,7 +354,7 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
             }
 #endif
 
-            // Validate header (16 bytes: magic + version + pad)
+            // Validate header (16 bytes: magic + version + n_act_sites)
             if (map_size < FP8_WEIGHTS_HEADER
                     || memcmp(base, "PRKTFP8", 7) != 0) {
                 if (mmap_ptr) munmap(mmap_ptr, map_size);
@@ -382,12 +370,26 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
                 return false;
             }
 
+            // Read n_act_sites from header (v1 had pad=0 here)
+            uint32_t n_act_sites = 0;
+            memcpy(&n_act_sites, base + 12, 4);
+
             // Single cudaMemcpy for fp8_pool (FP8 weights + scales at aligned offsets)
             CUDA_CHECK(cudaMemcpyAsync(fp8_pool, base + FP8_WEIGHTS_HEADER,
                                        pool_weights_size, cudaMemcpyHostToDevice, stream));
 
-            // Non-GEMM FP16 weights — same fixed order as fp8_save
+            // Load activation scales if present (v2 with calibration data)
             const uint8_t* p = base + FP8_WEIGHTS_HEADER + pool_weights_size;
+            if (n_act_sites == N_FP8_ACT_SITES) {
+                CUDA_CHECK(cudaMemcpyAsync(fp8_act_site_scales, p,
+                                           N_FP8_ACT_SITES * sizeof(float),
+                                           cudaMemcpyHostToDevice, stream));
+                p += N_FP8_ACT_SITES * sizeof(float);
+                fp8_calibrated = true;
+                fprintf(stderr, "  loaded %d activation scales (pre-calibrated)\n", (int)n_act_sites);
+            }
+
+            // Non-GEMM FP16 weights — same fixed order as fp8_save
             size_t off = 0;
             auto ul16 = [&](half* dst, size_t n) {
                 CUDA_CHECK(cudaMemcpyAsync(dst, p + off, n * sizeof(half),
@@ -501,443 +503,125 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
         }
     }
 
-    // Allocate CUTLASS workspace (queried for max GEMM size)
+    // Transpose NN FP8 weights from [K,N] to [N,K] RowMajor for CUTLASS SM120.
+    // The SM120 blockwise MMA kernel reads B with stride (K,1,0) — i.e. B[N,K]
+    // row-major — despite declaring LayoutB = ColumnMajor. NN weights stored as
+    // [K,N] row-major must be transposed. NT weights (conv_pw1, conv_pw2) are
+    // already [N,K] in storage and need no transposing.
+    {
+        void* tmp = (void*)fp8_act_buf;
+        for (int b = 0; b < N_BLOCKS; b++) {
+            transpose_u8_inplace(fp8_qkv_w[b],  D_MODEL, 3 * D_MODEL, tmp, stream);
+            transpose_u8_inplace(fp8_ff1_w1[b],  D_MODEL, D_FF, tmp, stream);
+            transpose_u8_inplace(fp8_ff1_w2[b],  D_FF, D_MODEL, tmp, stream);
+            transpose_u8_inplace(fp8_pos_w[b],   D_MODEL, D_MODEL, tmp, stream);
+            transpose_u8_inplace(fp8_out_w[b],   D_MODEL, D_MODEL, tmp, stream);
+            transpose_u8_inplace(fp8_ff2_w1[b],  D_MODEL, D_FF, tmp, stream);
+            transpose_u8_inplace(fp8_ff2_w2[b],  D_FF, D_MODEL, tmp, stream);
+        }
+        transpose_u8_inplace(fp8_sub_out_w,  SUB_CHANNELS * 16, D_MODEL, tmp, stream);
+        transpose_u8_inplace(fp8_enc_proj_w, D_MODEL, D_JOINT, tmp, stream);
+    }
+
+    // Initialize CUTLASS FP8 kernels (scale buffers + workspace)
+    // max_M = 2*T_max to cover pos_enc projection (pos_len = 2*T-1)
+    cutlass_fp8_init(2 * T_max, D_FF, D_FF, stream);
+
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
-
-// ---------------------------------------------------------------------------
-// cublasLt GEMM algorithm cache (forward declaration for free())
-// ---------------------------------------------------------------------------
-
-struct GemmKey {
-    int m, n, k;
-    cublasOperation_t opA, opB;
-    bool accumulate;
-    bool has_bias;
-    bool operator==(const GemmKey& o) const {
-        return m == o.m && n == o.n && k == o.k && opA == o.opA && opB == o.opB
-            && accumulate == o.accumulate && has_bias == o.has_bias;
-    }
-};
-struct GemmKeyHash {
-    size_t operator()(const GemmKey& k) const {
-        size_t h = std::hash<int>()(k.m);
-        h ^= std::hash<int>()(k.n) * 2654435761ULL;
-        h ^= std::hash<int>()(k.k) * 40343;
-        h ^= std::hash<int>()(k.opA) * 73;
-        h ^= std::hash<int>()(k.opB) * 131;
-        h ^= std::hash<int>()(k.accumulate) * 257;
-        h ^= std::hash<int>()(k.has_bias) * 521;
-        return h;
-    }
-};
-struct GemmPlan {
-    cublasLtMatmulDesc_t matmul_desc;
-    cublasLtMatrixLayout_t layout_A, layout_B, layout_C;
-    cublasLtMatmulAlgo_t algo;
-    bool valid;
-};
-static std::unordered_map<GemmKey, GemmPlan, GemmKeyHash> gemm_cache;
-
-// FP8 GEMM plan cache (forward declaration for free())
-struct Fp8GemmPlan {
-    cublasLtMatmulDesc_t matmul_desc;
-    cublasLtMatrixLayout_t layout_A, layout_B, layout_C;
-    cublasLtMatmulAlgo_t algo;
-    bool valid;
-};
-static std::unordered_map<GemmKey, Fp8GemmPlan, GemmKeyHash> fp8_gemm_cache;
 
 // ---------------------------------------------------------------------------
 // CudaModel::free
 // ---------------------------------------------------------------------------
 
 void CudaModel::free() {
-    if (cublas) { cublasDestroy(cublas); cublas = nullptr; }
-    if (cublaslt) { cublasLtDestroy(cublaslt); cublaslt = nullptr; }
-    // Clean up cached cublasLt plans
-    for (auto& [key, plan] : gemm_cache) {
-        cublasLtMatmulDescDestroy(plan.matmul_desc);
-        cublasLtMatrixLayoutDestroy(plan.layout_A);
-        cublasLtMatrixLayoutDestroy(plan.layout_B);
-        cublasLtMatrixLayoutDestroy(plan.layout_C);
-    }
-    gemm_cache.clear();
-    for (auto& [key, plan] : fp8_gemm_cache) {
-        cublasLtMatmulDescDestroy(plan.matmul_desc);
-        cublasLtMatrixLayoutDestroy(plan.layout_A);
-        cublasLtMatrixLayoutDestroy(plan.layout_B);
-        cublasLtMatrixLayoutDestroy(plan.layout_C);
-    }
-    fp8_gemm_cache.clear();
-    if (lt_workspace) { cudaFree(lt_workspace); lt_workspace = nullptr; }
+    cutlass_fp8_free();
+    cutlass_gemm_free();
 
     // All inference buffers are carved from a single pooled allocation
     if (gpu_pool) { cudaFree(gpu_pool); gpu_pool = nullptr; }
     if (fp8_pool) { cudaFree(fp8_pool); fp8_pool = nullptr; }
 }
 
-// ---------------------------------------------------------------------------
-// cublasLt GEMM with algorithm caching
-// ---------------------------------------------------------------------------
-
-static GemmPlan& get_gemm_plan(cublasLtHandle_t lt, void* workspace, size_t ws_size,
-                                int col_m, int col_n, int col_k,
-                                int ldA, int ldB, int ldC,
-                                cublasOperation_t opA, cublasOperation_t opB,
-                                bool accumulate, bool has_bias = false) {
-    GemmKey key{col_m, col_n, col_k, opA, opB, accumulate, has_bias};
-    auto it = gemm_cache.find(key);
-    if (it != gemm_cache.end()) return it->second;
-
-    GemmPlan plan;
-    plan.valid = false;
-
-    CUBLAS_CHECK(cublasLtMatmulDescCreate(&plan.matmul_desc, CUBLAS_COMPUTE_16F, CUDA_R_16F));
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(plan.matmul_desc,
-        CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(plan.matmul_desc,
-        CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
-
-    if (has_bias) {
-        cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
-        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(plan.matmul_desc,
-            CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
-    }
-
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&plan.layout_A, CUDA_R_16F,
-        opA == CUBLAS_OP_N ? col_m : col_k,
-        opA == CUBLAS_OP_N ? col_k : col_m, ldA));
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&plan.layout_B, CUDA_R_16F,
-        opB == CUBLAS_OP_N ? col_k : col_n,
-        opB == CUBLAS_OP_N ? col_n : col_k, ldB));
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&plan.layout_C, CUDA_R_16F, col_m, col_n, ldC));
-
-    // Search for best algorithm
-    cublasLtMatmulPreference_t pref;
-    CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&pref));
-    CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(pref,
-        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_size, sizeof(ws_size)));
-
-    cublasLtMatmulHeuristicResult_t results[8];
-    int n_results = 0;
-    CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(lt, plan.matmul_desc,
-        plan.layout_A, plan.layout_B, plan.layout_C, plan.layout_C,
-        pref, 8, results, &n_results));
-    cublasLtMatmulPreferenceDestroy(pref);
-
-    if (n_results > 0) {
-        plan.algo = results[0].algo;
-        plan.valid = true;
-    }
-
-    return gemm_cache.emplace(key, plan).first->second;
-}
-
-// Core cublasLt GEMM call using cached plan
-static void lt_gemm(cublasLtHandle_t lt, cublasHandle_t h,
-                      void* workspace, size_t ws_size, cudaStream_t stream,
-                      cublasOperation_t opA, cublasOperation_t opB,
-                      int col_m, int col_n, int col_k,
-                      const half* A, int ldA,
-                      const half* B, int ldB,
-                      half* C, int ldC,
-                      bool accumulate, const half* bias = nullptr) {
-    half alpha = __float2half(1.0f);
-    half beta = __float2half(accumulate ? 1.0f : 0.0f);
-
-    GemmPlan& plan = get_gemm_plan(lt, workspace, ws_size,
-                                     col_m, col_n, col_k, ldA, ldB, ldC,
-                                     opA, opB, accumulate, bias != nullptr);
-    if (plan.valid) {
-        if (bias) {
-            CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(plan.matmul_desc,
-                CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
-        }
-        CUBLAS_CHECK(cublasLtMatmul(lt, plan.matmul_desc,
-            &alpha, A, plan.layout_A, B, plan.layout_B,
-            &beta, C, plan.layout_C, C, plan.layout_C,
-            &plan.algo, workspace, ws_size, stream));
-    } else {
-        // Fallback to cublasGemmEx (no bias epilogue support)
-        CUBLAS_CHECK(cublasGemmEx(h, opA, opB,
-            col_m, col_n, col_k, &alpha, A, CUDA_R_16F, ldA,
-            B, CUDA_R_16F, ldB, &beta, C, CUDA_R_16F, ldC,
-            CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-    }
-}
-
-// Y[m,n] = X[m,k] @ W[k,n]   (ONNX MatMul convention: W is [input, output])
-static void gemm_nn(cublasLtHandle_t lt, cublasHandle_t h,
-                     void* ws, size_t ws_size, cudaStream_t stream,
-                     const half* X, int m, int k,
-                     const half* W, int n, half* Y) {
-    // Row-major: Y[m,n] = X[m,k] @ W[k,n]
-    // Col-major: Y'[n,m] = W'[n,k] @ X'[k,m]
-    lt_gemm(lt, h, ws, ws_size, stream, CUBLAS_OP_N, CUBLAS_OP_N,
-            n, m, k, W, n, X, k, Y, n, false);
-}
-
-// Y[m,n] = X[m,k] @ W[k,n] + bias[n]  (ONNX MatMul + bias epilogue)
-static void gemm_nn_bias(cublasLtHandle_t lt, cublasHandle_t h,
-                          void* ws, size_t ws_size, cudaStream_t stream,
-                          const half* X, int m, int k,
-                          const half* W, int n, const half* bias, half* Y) {
-    lt_gemm(lt, h, ws, ws_size, stream, CUBLAS_OP_N, CUBLAS_OP_N,
-            n, m, k, W, n, X, k, Y, n, false, bias);
-}
-
-// Y[m,n] = X[m,k] @ W[n,k]^T  (Conv/PyTorch convention: W is [output, input])
-static void gemm_nt(cublasLtHandle_t lt, cublasHandle_t h,
-                     void* ws, size_t ws_size, cudaStream_t stream,
-                     const half* X, int m, int k,
-                     const half* W, int n, half* Y) {
-    // Row-major: Y[m,n] = X[m,k] @ W[n,k]^T
-    // Col-major: Y'[n,m] = W_T'[n,k] @ X'[k,m], W_T = CUBLAS_OP_T on W[k,n]-col
-    lt_gemm(lt, h, ws, ws_size, stream, CUBLAS_OP_T, CUBLAS_OP_N,
-            n, m, k, W, k, X, k, Y, n, false);
-}
-
-// Y += X @ W[n,k]^T  (accumulate, Conv/PyTorch convention)
-static void gemm_nt_accum(cublasLtHandle_t lt, cublasHandle_t h,
-                            void* ws, size_t ws_size, cudaStream_t stream,
-                            const half* X, int m, int k,
-                            const half* W, int n, half* Y) {
-    lt_gemm(lt, h, ws, ws_size, stream, CUBLAS_OP_T, CUBLAS_OP_N,
-            n, m, k, W, k, X, k, Y, n, true);
-}
-
-// Y[m,n] = X[m,k] @ W[n,k]^T + bias[n]  (NT with bias epilogue)
-static void gemm_nt_bias(cublasLtHandle_t lt, cublasHandle_t h,
-                           void* ws, size_t ws_size, cudaStream_t stream,
-                           const half* X, int m, int k,
-                           const half* W, int n, const half* bias, half* Y) {
-    lt_gemm(lt, h, ws, ws_size, stream, CUBLAS_OP_T, CUBLAS_OP_N,
-            n, m, k, W, k, X, k, Y, n, false, bias);
-}
-
-// Y += X @ W[n,k]^T + bias[n]  (NT accumulate with bias epilogue)
-static void gemm_nt_accum_bias(cublasLtHandle_t lt, cublasHandle_t h,
-                                 void* ws, size_t ws_size, cudaStream_t stream,
-                                 const half* X, int m, int k,
-                                 const half* W, int n, const half* bias, half* Y) {
-    lt_gemm(lt, h, ws, ws_size, stream, CUBLAS_OP_T, CUBLAS_OP_N,
-            n, m, k, W, k, X, k, Y, n, true, bias);
-}
-
-// ---------------------------------------------------------------------------
-// FP8 cublasLt GEMM — FP8 inputs, FP16 output, FP32 accumulation
-// ---------------------------------------------------------------------------
-
-static Fp8GemmPlan& get_fp8_gemm_plan(cublasLtHandle_t lt, void* workspace, size_t ws_size,
-                                        int col_m, int col_n, int col_k,
-                                        int ldA, int ldB, int ldC,
-                                        cublasOperation_t opA, cublasOperation_t opB,
-                                        bool accumulate) {
-    GemmKey key{col_m, col_n, col_k, opA, opB, accumulate, false};
-    auto it = fp8_gemm_cache.find(key);
-    if (it != fp8_gemm_cache.end()) return it->second;
-
-    Fp8GemmPlan plan;
-    plan.valid = false;
-
-    CUBLAS_CHECK(cublasLtMatmulDescCreate(&plan.matmul_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(plan.matmul_desc,
-        CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(plan.matmul_desc,
-        CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
-
-    // Note: bias epilogue is NOT supported with FP8 on Blackwell — bias added separately
-
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&plan.layout_A, CUDA_R_8F_E4M3,
-        opA == CUBLAS_OP_N ? col_m : col_k,
-        opA == CUBLAS_OP_N ? col_k : col_m, ldA));
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&plan.layout_B, CUDA_R_8F_E4M3,
-        opB == CUBLAS_OP_N ? col_k : col_n,
-        opB == CUBLAS_OP_N ? col_n : col_k, ldB));
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&plan.layout_C, CUDA_R_16F, col_m, col_n, ldC));
-
-    cublasLtMatmulPreference_t pref;
-    CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&pref));
-    CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(pref,
-        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_size, sizeof(ws_size)));
-
-    cublasLtMatmulHeuristicResult_t results[8];
-    int n_results = 0;
-    cublasStatus_t st = cublasLtMatmulAlgoGetHeuristic(lt, plan.matmul_desc,
-        plan.layout_A, plan.layout_B, plan.layout_C, plan.layout_C,
-        pref, 8, results, &n_results);
-    cublasLtMatmulPreferenceDestroy(pref);
-
-    if (st == CUBLAS_STATUS_SUCCESS && n_results > 0) {
-        plan.algo = results[0].algo;
-        plan.valid = true;
-    } else {
-        fprintf(stderr, "FP8 heuristic: m=%d n=%d k=%d opA=%d opB=%d => status=%d n_results=%d\n",
-                col_m, col_n, col_k, (int)opA, (int)opB, (int)st, n_results);
-    }
-
-    return fp8_gemm_cache.emplace(key, plan).first->second;
-}
-
-// FP8 GEMM: quantizes activation B, uses pre-quantized weight A.
-// site_scale: per-activation-site cached scale (on GPU). On calibration pass,
-//   absmax is computed and written here. On subsequent passes, reused as-is.
-// prequantized: if true, act_buf already contains FP8 data (from fused kernel),
-//   skip the quantization step entirely.
-static void lt_gemm_fp8(cublasLtHandle_t lt, cublasHandle_t h,
-                          void* workspace, size_t ws_size, cudaStream_t stream,
-                          cublasOperation_t opA, cublasOperation_t opB,
-                          int col_m, int col_n, int col_k,
-                          const uint8_t* A_fp8, int ldA, const float* a_scale,
-                          const half* B_fp16, int ldB,
-                          half* C, int ldC,
-                          uint8_t* act_buf, float* site_scale, int* amax_buf,
-                          bool accumulate, bool calibrated,
-                          bool prequantized = false) {
-    if (!prequantized) {
-        int b_elems = (opB == CUBLAS_OP_N) ? col_k * col_n : col_n * col_k;
-        if (!calibrated) {
-            // Calibration: full absmax + quantize, stores scale in *site_scale
-            quantize_absmax_fp16_to_fp8(B_fp16, act_buf, site_scale, b_elems, amax_buf, stream);
-        } else {
-            // Runtime: single-pass quantize using cached scale
-            quantize_fp8_static(B_fp16, act_buf, site_scale, b_elems, stream);
-        }
-    }
-
-    float alpha = 1.0f;
-    float beta = accumulate ? 1.0f : 0.0f;
-
-    Fp8GemmPlan& plan = get_fp8_gemm_plan(lt, workspace, ws_size,
-                                            col_m, col_n, col_k, ldA, ldB, ldC,
-                                            opA, opB, accumulate);
-    if (plan.valid) {
-        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(plan.matmul_desc,
-            CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &a_scale, sizeof(a_scale)));
-        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(plan.matmul_desc,
-            CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &site_scale, sizeof(site_scale)));
-        CUBLAS_CHECK(cublasLtMatmul(lt, plan.matmul_desc,
-            &alpha, A_fp8, plan.layout_A, act_buf, plan.layout_B,
-            &beta, C, plan.layout_C, C, plan.layout_C,
-            &plan.algo, workspace, ws_size, stream));
-    } else {
-        fprintf(stderr, "FP8 GEMM: no valid algorithm found for m=%d n=%d k=%d\n",
-                col_m, col_n, col_k);
-        std::exit(1);
-    }
-}
-
-// FP8 wrappers — take per-site cached scale + calibration flag + prequantized
-static void gemm_nn_fp8(cublasLtHandle_t lt, cublasHandle_t h,
-                          void* ws, size_t ws_size, cudaStream_t stream,
-                          const half* X, int m, int k,
-                          const uint8_t* W_fp8, int n, const float* w_scale,
-                          half* Y, uint8_t* act_buf, float* site_scale,
-                          int* amax_buf, bool calibrated,
-                          bool prequantized = false) {
-    lt_gemm_fp8(lt, h, ws, ws_size, stream, CUBLAS_OP_N, CUBLAS_OP_N,
-                n, m, k, W_fp8, n, w_scale, X, k, Y, n,
-                act_buf, site_scale, amax_buf, false, calibrated, prequantized);
-}
-
-static void gemm_nn_bias_fp8(cublasLtHandle_t lt, cublasHandle_t h,
-                               void* ws, size_t ws_size, cudaStream_t stream,
-                               const half* X, int m, int k,
-                               const uint8_t* W_fp8, int n, const float* w_scale,
-                               const half* bias, half* Y, uint8_t* act_buf,
-                               float* site_scale, int* amax_buf, bool calibrated,
-                               bool prequantized = false) {
-    lt_gemm_fp8(lt, h, ws, ws_size, stream, CUBLAS_OP_N, CUBLAS_OP_N,
-                n, m, k, W_fp8, n, w_scale, X, k, Y, n,
-                act_buf, site_scale, amax_buf, false, calibrated, prequantized);
-    bias_add_row_fp16(Y, bias, m, n, stream);
-}
-
-static void gemm_nt_fp8(cublasLtHandle_t lt, cublasHandle_t h,
-                          void* ws, size_t ws_size, cudaStream_t stream,
-                          const half* X, int m, int k,
-                          const uint8_t* W_fp8, int n, const float* w_scale,
-                          half* Y, uint8_t* act_buf, float* site_scale,
-                          int* amax_buf, bool calibrated,
-                          bool prequantized = false) {
-    lt_gemm_fp8(lt, h, ws, ws_size, stream, CUBLAS_OP_T, CUBLAS_OP_N,
-                n, m, k, W_fp8, k, w_scale, X, k, Y, n,
-                act_buf, site_scale, amax_buf, false, calibrated, prequantized);
-}
-
-static void gemm_nt_bias_fp8(cublasLtHandle_t lt, cublasHandle_t h,
-                               void* ws, size_t ws_size, cudaStream_t stream,
-                               const half* X, int m, int k,
-                               const uint8_t* W_fp8, int n, const float* w_scale,
-                               const half* bias, half* Y, uint8_t* act_buf,
-                               float* site_scale, int* amax_buf, bool calibrated,
-                               bool prequantized = false) {
-    lt_gemm_fp8(lt, h, ws, ws_size, stream, CUBLAS_OP_T, CUBLAS_OP_N,
-                n, m, k, W_fp8, k, w_scale, X, k, Y, n,
-                act_buf, site_scale, amax_buf, false, calibrated, prequantized);
-    bias_add_row_fp16(Y, bias, m, n, stream);
-}
-
-// Batched strided GEMM: C[b,m,n] = A[b,m,k] @ B[b,k,n]
-// A is [b,m,k], B is [b,k,n], C is [b,m,n]
-static void batched_gemm_nn(cublasHandle_t h,
-                             const half* A, const half* B, half* C,
-                             int batch, int m, int n, int k,
-                             long long strideA, long long strideB, long long strideC) {
-    half alpha = __float2half(1.0f), beta = __float2half(0.0f);
-    // Row-major C[m,n] = A[m,k] @ B[k,n]
-    // Col-major: C'[n,m] = B'[n,k] @ A'[k,m]
-    CUBLAS_CHECK(cublasGemmStridedBatchedEx(h, CUBLAS_OP_N, CUBLAS_OP_N,
-        n, m, k, &alpha, B, CUDA_R_16F, n, strideB,
-        A, CUDA_R_16F, k, strideA, &beta, C, CUDA_R_16F, n, strideC,
-        batch, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-}
-
-// Batched strided GEMM: C[b,m,n] = A[b,m,k] @ B[b,n,k]^T  (B transposed)
-// A is [b,m,k], B is [b,n,k], C is [b,m,n]
-static void batched_gemm_nt(cublasHandle_t h,
-                             const half* A, const half* B, half* C,
-                             int batch, int m, int n, int k,
-                             long long strideA, long long strideB, long long strideC) {
-    half alpha = __float2half(1.0f), beta = __float2half(0.0f);
-    // Row-major C[m,n] = A[m,k] @ B[n,k]^T
-    // Col-major: C'[n,m] = B_T'[n,k] @ A'[k,m], B_T = CUBLAS_OP_T
-    CUBLAS_CHECK(cublasGemmStridedBatchedEx(h, CUBLAS_OP_T, CUBLAS_OP_N,
-        n, m, k, &alpha, B, CUDA_R_16F, k, strideB,
-        A, CUDA_R_16F, k, strideA, &beta, C, CUDA_R_16F, n, strideC,
-        batch, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-}
-
 // Position encoding generation moved to GPU kernel (generate_pos_encoding_gpu)
 
 int CudaModel::encode_gpu(int T_mel) {
-    // Local FP16 GEMM helpers (kept for small sub-conv GEMMs and batched GEMMs)
+    // Local FP16 GEMM helper (CUTLASS)
     auto gnn = [&](const half* X, int m, int k, const half* W, int n, half* Y) {
-        gemm_nn(cublaslt, cublas, lt_workspace, lt_workspace_size, stream, X, m, k, W, n, Y);
+        cutlass_gemm_nn(stream, X, m, k, W, n, Y);
     };
 
-    // Local FP8 GEMM helpers — cublasLt FP8 with per-site cached activation scales
+    // FP8 GEMM helpers — dual-mode dispatch:
+    //   Calibration (cal=false): CUTLASS FP8 with absmax scale (sync read from GPU)
+    //   Runtime (cal=true):      CUTLASS FP8 with pre-cached host scales
     bool cal = fp8_calibrated;
+
+    // After calibration, copy scales to host for CUTLASS alpha computation.
+    if (cal && !cutlass_scales_ready) {
+        CUDA_CHECK(cudaMemcpy(host_wt_scales, fp8_scales,
+                              N_FP8_SCALES * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(host_act_scales, fp8_act_site_scales,
+                              N_FP8_ACT_SITES * sizeof(float), cudaMemcpyDeviceToHost));
+        cutlass_scales_ready = true;
+    }
 
     auto gnn8 = [&](const half* X, int m, int k, const uint8_t* W, int n,
                      const float* ws, int si, half* Y, bool preq = false) {
-        gemm_nn_fp8(cublaslt, cublas, lt_workspace, lt_workspace_size, stream,
-                    X, m, k, W, n, ws, Y, fp8_act_buf,
-                    &fp8_act_site_scales[si], fp8_amax_buf, cal, preq);
+        if (!cal) {
+            if (!preq)
+                quantize_absmax_fp16_to_fp8(X, fp8_act_buf, &fp8_act_site_scales[si],
+                                            m * k, fp8_amax_buf, stream);
+            float act_s, wt_s;
+            CUDA_CHECK(cudaMemcpy(&act_s, &fp8_act_site_scales[si], sizeof(float), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(&wt_s, ws, sizeof(float), cudaMemcpyDeviceToHost));
+            cutlass_fp8_nn(stream, m, n, k, fp8_act_buf, W, Y, act_s * wt_s);
+        } else {
+            if (!preq)
+                quantize_fp8_static(X, fp8_act_buf, &fp8_act_site_scales[si], m * k, stream);
+            int wt_idx = (int)(ws - fp8_scales);
+            float alpha = host_act_scales[si] * host_wt_scales[wt_idx];
+            cutlass_fp8_nn(stream, m, n, k, fp8_act_buf, W, Y, alpha);
+        }
     };
     auto gnn8_bias = [&](const half* X, int m, int k, const uint8_t* W, int n,
                           const float* ws, int si, const half* bias, half* Y,
                           bool preq = false) {
-        gemm_nn_bias_fp8(cublaslt, cublas, lt_workspace, lt_workspace_size, stream,
-                         X, m, k, W, n, ws, bias, Y, fp8_act_buf,
-                         &fp8_act_site_scales[si], fp8_amax_buf, cal, preq);
+        if (!cal) {
+            if (!preq)
+                quantize_absmax_fp16_to_fp8(X, fp8_act_buf, &fp8_act_site_scales[si],
+                                            m * k, fp8_amax_buf, stream);
+            float act_s, wt_s;
+            CUDA_CHECK(cudaMemcpy(&act_s, &fp8_act_site_scales[si], sizeof(float), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(&wt_s, ws, sizeof(float), cudaMemcpyDeviceToHost));
+            cutlass_fp8_nn(stream, m, n, k, fp8_act_buf, W, Y, act_s * wt_s);
+            bias_add_row_fp16(Y, bias, m, n, stream);
+        } else {
+            if (!preq)
+                quantize_fp8_static(X, fp8_act_buf, &fp8_act_site_scales[si], m * k, stream);
+            int wt_idx = (int)(ws - fp8_scales);
+            float alpha = host_act_scales[si] * host_wt_scales[wt_idx];
+            cutlass_fp8_nn(stream, m, n, k, fp8_act_buf, W, Y, alpha);
+            bias_add_row_fp16(Y, bias, m, n, stream);
+        }
     };
+    // NT weights are stored as [N,K] — already correct layout for cutlass_fp8_nn
     auto gnt8 = [&](const half* X, int m, int k, const uint8_t* W, int n,
                      const float* ws, int si, half* Y, bool preq = false) {
-        gemm_nt_fp8(cublaslt, cublas, lt_workspace, lt_workspace_size, stream,
-                    X, m, k, W, n, ws, Y, fp8_act_buf,
-                    &fp8_act_site_scales[si], fp8_amax_buf, cal, preq);
+        if (!cal) {
+            if (!preq)
+                quantize_absmax_fp16_to_fp8(X, fp8_act_buf, &fp8_act_site_scales[si],
+                                            m * k, fp8_amax_buf, stream);
+            float act_s, wt_s;
+            CUDA_CHECK(cudaMemcpy(&act_s, &fp8_act_site_scales[si], sizeof(float), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(&wt_s, ws, sizeof(float), cudaMemcpyDeviceToHost));
+            cutlass_fp8_nn(stream, m, n, k, fp8_act_buf, W, Y, act_s * wt_s);
+        } else {
+            if (!preq)
+                quantize_fp8_static(X, fp8_act_buf, &fp8_act_site_scales[si], m * k, stream);
+            int wt_idx = (int)(ws - fp8_scales);
+            float alpha = host_act_scales[si] * host_wt_scales[wt_idx];
+            cutlass_fp8_nn(stream, m, n, k, fp8_act_buf, W, Y, alpha);
+        }
     };
     // Weight scale helper: fp8_scales[blk * 9 + offset]
     auto bscale = [&](int blk, int off) -> const float* { return &fp8_scales[blk * 9 + off]; };
@@ -954,8 +638,8 @@ int CudaModel::encode_gpu(int T_mel) {
     int H = T_mel, W = 128;
     int H2 = (H + 2 * 1 - 3) / 2 + 1;
     int W2 = (W + 2 * 1 - 3) / 2 + 1;
-    im2col_2d_fp16(sub_buf[0], ff_mid, 1, H, W, 3, 3, 2, 1, H2, W2, stream);
-    gnn(w->sub_conv[0].weight, SUB_CHANNELS, 9, ff_mid, H2 * W2, sub_buf[1]);
+    conv2d_fp16(sub_buf[0], w->sub_conv[0].weight, nullptr,
+                sub_buf[1], 1, H, W, SUB_CHANNELS, 3, 3, 2, 1, 1, stream);
     bias_relu_nchw_fp16(sub_buf[1], w->sub_conv[0].bias, SUB_CHANNELS, H2 * W2, stream);
     H = H2; W = W2;
 
@@ -1040,27 +724,22 @@ int CudaModel::encode_gpu(int T_mel) {
             gnn8(pos_enc_T, pos_len, D_MODEL, fp8_pos_w[blk], D_MODEL, bscale(blk, 5), asite(blk, 3), pos_temp, false);
 
             // Batched GEMMs stay FP16 (dynamic activations, not weight matrices)
-            {
-                half alpha_h = __float2half(1.0f), beta_h = __float2half(0.0f);
-                CUBLAS_CHECK(cublasGemmStridedBatchedEx(cublas,
-                    CUBLAS_OP_T, CUBLAS_OP_N,
-                    pos_len, T, HEAD_DIM,
-                    &alpha_h,
-                    pos_temp, CUDA_R_16F, D_MODEL, (long long)HEAD_DIM,
-                    q_v_buf, CUDA_R_16F, HEAD_DIM, (long long)T * HEAD_DIM,
-                    &beta_h,
-                    pos_scores, CUDA_R_16F, pos_len, (long long)T * pos_len,
-                    N_HEADS, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-            }
+            // Position scores: pos_scores[h,T,pos_len] = q_v[h,T,HEAD_DIM] @ pos_temp[h,pos_len,HEAD_DIM]^T
+            // pos_temp layout: [pos_len, D_MODEL] with stride HEAD_DIM between heads
+            cutlass_batched_gemm_nt_ex(stream,
+                q_v_buf, HEAD_DIM, (long long)T * HEAD_DIM,
+                pos_temp, D_MODEL, (long long)HEAD_DIM,
+                pos_scores, pos_len, (long long)T * pos_len,
+                N_HEADS, T, pos_len, HEAD_DIM);
 
             float scale = 1.0f / sqrtf((float)HEAD_DIM);
 
-            batched_gemm_nt(cublas, q_u, K_h, scores,
+            cutlass_batched_gemm_nt(stream, q_u, K_h, scores,
                             N_HEADS, T, T, HEAD_DIM,
                             (long long)T * HEAD_DIM, (long long)T * HEAD_DIM, (long long)T * T);
             fused_score_softmax_fp16(scores, pos_scores, scores,
                                       N_HEADS, T, scale, stream);
-            batched_gemm_nn(cublas, scores, V_h, attn_out,
+            cutlass_batched_gemm_nn(stream, scores, V_h, attn_out,
                             N_HEADS, T, HEAD_DIM, T,
                             (long long)T * T, (long long)T * HEAD_DIM, (long long)T * HEAD_DIM);
             // transpose_0213 → asite(blk, 4) feeds out_w
@@ -1159,12 +838,12 @@ void CudaModel::decoder_reset() {
 // ---------------------------------------------------------------------------
 
 half* CudaModel::decode_step(int enc_frame_idx, int prev_token) {
-    // Decoder GEMMs use FP16 — cublasLt FP8 doesn't support N=1 (single-vector output)
+    // Decoder GEMMs use FP16 (CUTLASS) — single-vector outputs
     auto gnn_b = [&](const half* X, int m, int k, const half* W, int n, const half* bias, half* Y) {
-        gemm_nn_bias(cublaslt, cublas, lt_workspace, lt_workspace_size, stream, X, m, k, W, n, bias, Y);
+        cutlass_gemm_nn_bias(stream, X, m, k, W, n, bias, Y);
     };
     auto gnt_b = [&](const half* X, int m, int k, const half* W, int n, const half* bias, half* Y) {
-        gemm_nt_bias(cublaslt, cublas, lt_workspace, lt_workspace_size, stream, X, m, k, W, n, bias, Y);
+        cutlass_gemm_nt_bias(stream, X, m, k, W, n, bias, Y);
     };
 
     // 1. Embed + concat with h[0] for LSTM0 input: lstm_input = [embed; h[0]]
@@ -1199,4 +878,125 @@ void CudaModel::decoder_commit() {
     std::swap(lstm_c[0], lstm_c_out[0]);
     std::swap(lstm_h[1], lstm_h_out[1]);
     std::swap(lstm_c[1], lstm_c_out[1]);
+}
+
+// ---------------------------------------------------------------------------
+// Offline calibration — accumulate per-site max absmax across utterances
+// ---------------------------------------------------------------------------
+
+void CudaModel::finalize_calibration() {
+    // Compute final activation scales: scale[i] = max_absmax[i] / 448.0
+    for (int i = 0; i < N_FP8_ACT_SITES; i++) {
+        float s = host_act_absmax[i] / 448.0f;
+        if (s == 0.0f) s = 1.0f;  // avoid division by zero
+        host_act_scales[i] = s;
+    }
+    // Upload to GPU
+    CUDA_CHECK(cudaMemcpy(fp8_act_site_scales, host_act_scales,
+                           N_FP8_ACT_SITES * sizeof(float), cudaMemcpyHostToDevice));
+    fp8_calibrated = true;
+    cutlass_scales_ready = false;  // force re-read of scales
+}
+
+void CudaModel::save_calibrated(const char* path) {
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // Transpose NN weights back from [N,K] to [K,N] for storage
+    void* tmp = (void*)fp8_act_buf;
+    for (int b = 0; b < N_BLOCKS; b++) {
+        transpose_u8_inplace(fp8_qkv_w[b],  3 * D_MODEL, D_MODEL, tmp, stream);
+        transpose_u8_inplace(fp8_ff1_w1[b],  D_FF, D_MODEL, tmp, stream);
+        transpose_u8_inplace(fp8_ff1_w2[b],  D_MODEL, D_FF, tmp, stream);
+        transpose_u8_inplace(fp8_pos_w[b],   D_MODEL, D_MODEL, tmp, stream);
+        transpose_u8_inplace(fp8_out_w[b],   D_MODEL, D_MODEL, tmp, stream);
+        transpose_u8_inplace(fp8_ff2_w1[b],  D_FF, D_MODEL, tmp, stream);
+        transpose_u8_inplace(fp8_ff2_w2[b],  D_MODEL, D_FF, tmp, stream);
+    }
+    transpose_u8_inplace(fp8_sub_out_w,  D_MODEL, SUB_CHANNELS * 16, tmp, stream);
+    transpose_u8_inplace(fp8_enc_proj_w, D_JOINT, D_MODEL, tmp, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // Compute pool blob size (same as in init)
+    size_t pool_weights_size = (size_t)((char*)(fp8_scales + N_FP8_SCALES) - (char*)fp8_pool);
+
+    // Part 1: fp8_pool blob (NT weights now in original [N,K] layout)
+    std::vector<uint8_t> pool_buf(pool_weights_size);
+    CUDA_CHECK(cudaMemcpy(pool_buf.data(), fp8_pool, pool_weights_size,
+                           cudaMemcpyDeviceToHost));
+
+    // Part 2: activation scales
+    std::vector<float> act_scales(N_FP8_ACT_SITES);
+    CUDA_CHECK(cudaMemcpy(act_scales.data(), fp8_act_site_scales,
+                           N_FP8_ACT_SITES * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // Part 3: non-GEMM FP16 weights
+    std::vector<half> fp16_buf;
+    auto save16 = [&](const half* ptr, size_t n) {
+        size_t old = fp16_buf.size();
+        fp16_buf.resize(old + n);
+        CUDA_CHECK(cudaMemcpy(fp16_buf.data() + old, ptr, n * sizeof(half),
+                               cudaMemcpyDeviceToHost));
+    };
+    for (int i : {0, 2, 3, 5, 6}) {
+        size_t wn = (i == 3 || i == 6) ? (size_t)SUB_CHANNELS * SUB_CHANNELS
+                                        : SUB_CHANNELS * 9;
+        save16(w->sub_conv[i].weight, wn);
+        save16(w->sub_conv[i].bias,   SUB_CHANNELS);
+    }
+    save16(w->sub_out_b, D_MODEL);
+    for (int b = 0; b < N_BLOCKS; b++) {
+        auto& blk = w->blocks[b];
+        save16(blk.ff1_ln_w,   D_MODEL); save16(blk.ff1_ln_b,   D_MODEL);
+        save16(blk.mhsa_ln_w,  D_MODEL); save16(blk.mhsa_ln_b,  D_MODEL);
+        save16(blk.pos_bias_u, (size_t)N_HEADS * HEAD_DIM);
+        save16(blk.pos_bias_v, (size_t)N_HEADS * HEAD_DIM);
+        save16(blk.conv_ln_w,  D_MODEL); save16(blk.conv_ln_b,  D_MODEL);
+        save16(blk.conv_dw_w,  (size_t)D_MODEL * CONV_K);
+        save16(blk.conv_dw_b,  D_MODEL);
+        save16(blk.ff2_ln_w,   D_MODEL); save16(blk.ff2_ln_b,   D_MODEL);
+        save16(blk.final_ln_w, D_MODEL); save16(blk.final_ln_b, D_MODEL);
+    }
+    save16(w->embed_w,       (size_t)N_VOCAB * D_PRED);
+    save16(lstm_combined_w[0],    (size_t)4 * D_PRED * 2 * D_PRED);
+    save16(lstm_combined_w[1],    (size_t)4 * D_PRED * 2 * D_PRED);
+    save16(lstm_combined_bias[0], 4 * D_PRED);
+    save16(lstm_combined_bias[1], 4 * D_PRED);
+    save16(w->dec_proj_w,    (size_t)D_PRED  * D_JOINT);
+    save16(w->out_proj_w,    (size_t)D_JOINT * D_OUTPUT);
+    save16(w->enc_proj_b,    D_JOINT);
+    save16(w->dec_proj_b,    D_JOINT);
+    save16(w->out_proj_b,    D_OUTPUT);
+
+    FILE* f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "  warning: cannot write %s\n", path); return; }
+
+    const char magic[8] = "PRKTFP8";
+    uint32_t version = FP8_WEIGHTS_VERSION;
+    uint32_t n_act_sites = (uint32_t)N_FP8_ACT_SITES;
+    fwrite(magic,           8, 1, f);
+    fwrite(&version,        4, 1, f);
+    fwrite(&n_act_sites,    4, 1, f);
+    fwrite(pool_buf.data(), 1, pool_weights_size, f);
+    fwrite(act_scales.data(), sizeof(float), N_FP8_ACT_SITES, f);
+    fwrite(fp16_buf.data(), sizeof(half), fp16_buf.size(), f);
+    fclose(f);
+
+    size_t total_mb = (pool_weights_size + N_FP8_ACT_SITES * sizeof(float)
+                       + fp16_buf.size() * sizeof(half)) / (1024*1024);
+    fprintf(stderr, "  saved calibrated weights_fp8.bin to %s (%zu MB, %d act sites)\n",
+            path, total_mb, (int)n_act_sites);
+
+    // Re-transpose NN weights back to [N,K] for runtime
+    for (int b = 0; b < N_BLOCKS; b++) {
+        transpose_u8_inplace(fp8_qkv_w[b],  D_MODEL, 3 * D_MODEL, tmp, stream);
+        transpose_u8_inplace(fp8_ff1_w1[b],  D_MODEL, D_FF, tmp, stream);
+        transpose_u8_inplace(fp8_ff1_w2[b],  D_FF, D_MODEL, tmp, stream);
+        transpose_u8_inplace(fp8_pos_w[b],   D_MODEL, D_MODEL, tmp, stream);
+        transpose_u8_inplace(fp8_out_w[b],   D_MODEL, D_MODEL, tmp, stream);
+        transpose_u8_inplace(fp8_ff2_w1[b],  D_MODEL, D_FF, tmp, stream);
+        transpose_u8_inplace(fp8_ff2_w2[b],  D_FF, D_MODEL, tmp, stream);
+    }
+    transpose_u8_inplace(fp8_sub_out_w,  SUB_CHANNELS * 16, D_MODEL, tmp, stream);
+    transpose_u8_inplace(fp8_enc_proj_w, D_MODEL, D_JOINT, tmp, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 }

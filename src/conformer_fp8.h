@@ -1,4 +1,4 @@
-// conformer_fp8.h — FP8 CudaModel (cublasLt E4M3 backend)
+// conformer_fp8.h — FP8 CudaModel (CUTLASS FP8 E4M3 backend)
 //
 // Included via -include flag for the FP8 build, overriding conformer.h.
 // Defines PARAKETTO_FP8 and extends CudaModel with FP8 quantization fields.
@@ -13,8 +13,6 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <cublas_v2.h>
-#include <cublasLt.h>
 
 // ---------------------------------------------------------------------------
 // Weight file format
@@ -25,11 +23,12 @@
 //   uint32 version = 2
 //   [raw FP16 tensor data, 256-byte aligned, fixed layout from source]
 //
-// weights_fp8.bin (self-contained FP8 weights, all needed data):
-//   char[8] magic  = "PRKTFP8\0"
-//   uint32  version = 1
-//   uint32  pad     = 0
-//   [fp8_pool blob: FP8 quantized weights + scales, pool layout, single cudaMemcpy]
+// weights_fp8.bin v2 (self-contained FP8 weights, all needed data):
+//   char[8] magic       = "PRKTFP8\0"
+//   uint32  version     = 2
+//   uint32  n_act_sites = 218 (0 in v1 for backward compat)
+//   [fp8_pool blob: FP8 quantized weights + weight scales, pool layout]
+//   [activation scales: n_act_sites × float32 — only if n_act_sites > 0]
 //   [non-GEMM FP16 blob: LN, biases, conv_dw, embed, LSTM, decoder — packed]
 //
 // Tensor layout for both files is defined in source (weights.cpp / conformer_fp8.cpp).
@@ -38,8 +37,8 @@ static constexpr uint32_t WEIGHTS_MAGIC    = 0x544B5250;  // "PRKT"
 static constexpr uint32_t WEIGHTS_VERSION  = 2;
 static constexpr size_t   WEIGHTS_HEADER   = 8;  // magic(4) + version(4)
 
-static constexpr uint32_t FP8_WEIGHTS_VERSION = 1;
-static constexpr size_t   FP8_WEIGHTS_HEADER  = 16;  // magic(8) + version(4) + pad(4)
+static constexpr uint32_t FP8_WEIGHTS_VERSION = 2;
+static constexpr size_t   FP8_WEIGHTS_HEADER  = 16;  // magic(8) + version(4) + n_act_sites(4)
 
 // ---------------------------------------------------------------------------
 // Model constants
@@ -198,10 +197,16 @@ struct CudaModel {
     int*     fp8_amax_buf             = nullptr;
     bool     fp8_calibrated           = false;
 
-    cublasHandle_t   cublas            = nullptr;
-    cublasLtHandle_t cublaslt          = nullptr;
-    void*            lt_workspace      = nullptr;
-    size_t           lt_workspace_size = 0;
+    // Host-side scale cache for CUTLASS FP8 path (copied from GPU after calibration)
+    float host_wt_scales[N_FP8_SCALES]    = {};
+    float host_act_scales[N_FP8_ACT_SITES] = {};
+    bool  cutlass_scales_ready            = false;
+
+    // Offline calibration state
+    bool  calibrating = false;
+    float host_act_absmax[N_FP8_ACT_SITES] = {};
+    void  finalize_calibration();
+    void  save_calibrated(const char* path);
 
     /// fp8_path: path to weights_fp8.bin (load if exists, save after quantization).
     /// Pass "embedded" when weights_fp8.bin is compiled in (EMBEDDED_WEIGHTS build).
